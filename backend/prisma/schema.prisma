@@ -1,0 +1,2455 @@
+// Prometheus - Prisma schema
+//
+// MODULE 01 SCOPE: the shared relational foundation.
+// MODULE 02 ADDITION: `AuthAccount` (see the block at the end of this file).
+// MODULE 05 ADDITION: `Strategy` (see the block after `AuthAccount`).
+// MODULE 06b ADDITION: `MarketCandle`, `StrategySimulation`, `StrategyFill`,
+//                      `StrategyDailyBalance` (see the block at the end).
+// MODULE 06c ADDITION: `PaperAccount`, `PaperOrder`, `PaperPosition`.
+// MODULE 07 ADDITION: `StrategyFollow`, `CopyAccount`, `CopyPosition`,
+//                      `CopyEvent` (see the block at the end of this file).
+// MODULE 08 ADDITION: `UsdtOrder` (see the block at the end of this file).
+//
+// PostgreSQL is the source of truth; Prisma is the data-access layer. This file
+// holds schema only. No business logic, no wallet accounting, no exchange or
+// copy-trading behaviour lives here or in this module.
+//
+// Conventions applied throughout:
+//  - UUID primary keys for every application entity.
+//  - NUMERIC(38,18) for every persisted financial quantity, surfaced in
+//    TypeScript as Prisma.Decimal. JavaScript floats are never used for money;
+//    binary floating point cannot represent decimal currency exactly, so
+//    0.1 + 0.2 !== 0.3 and balances would drift.
+//  - UTC timestamps on every row (PostgreSQL timestamptz).
+//  - Financial history is never silently deleted: see the onDelete rules.
+//
+// Migrations go through `prisma migrate dev`. Never hand-edit the database and
+// never use `db push` on a shared database.
+// Introspection is not enabled by design so the schema is always authored.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+//
+// Extensible but constrained. Adding a value later is an `ALTER TYPE ... ADD
+// VALUE` in a new migration, which keeps the set reviewable and keeps the
+// database able to reject a type the application does not understand.
+// ---------------------------------------------------------------------------
+
+/// Lifecycle of an application user.
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+/// A capability granted to a user (RBAC).
+///
+/// Stored as rows in `user_roles` rather than a column so one account can hold
+/// several roles (for example an EXPERT_TRADER who is also a
+/// LIQUIDITY_PROVIDER) and future roles need no schema change. USER is the
+/// baseline granted to every account; the others are granted explicitly.
+enum Role {
+  USER
+  EXPERT_TRADER
+  LIQUIDITY_PROVIDER
+  PLATFORM_ADMIN
+}
+
+/// Lifecycle of a role-grant request submitted by a user and decided by an
+/// administrator. Approval is what grants the role - there is no self-serve
+/// path to EXPERT_TRADER or LIQUIDITY_PROVIDER.
+enum RoleRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+/// Lifecycle of a wallet. FROZEN exists so later modules can halt movement
+/// without destroying the row or its balance history.
+enum WalletStatus {
+  ACTIVE
+  FROZEN
+}
+
+/// What an asset is, so later modules can apply asset-appropriate rules
+/// (for example, only STABLECOIN is tradeable in the USDT exchange).
+enum AssetKind {
+  FIAT
+  STABLECOIN
+  TOKEN
+}
+
+/// The primitive accounting movement a transaction represents.
+///
+/// This is deliberately a small set of primitives rather than one value per
+/// business feature: later modules compose these rather than invent their own
+/// ledger vocabulary. A USDT buy, an EMBER transfer and a manual credit are
+/// all expressed with these plus their own detail tables.
+enum TransactionType {
+  /// Value entering a wallet (fiat deposit, mint, or inbound transfer).
+  DEPOSIT
+  /// Value leaving a wallet.
+  WITHDRAWAL
+  /// Inbound leg of a transfer between wallets.
+  TRANSFER_IN
+  /// Outbound leg of a transfer between wallets.
+  TRANSFER_OUT
+  /// Moves available balance into locked balance.
+  LOCK
+  /// Moves locked balance back into available balance.
+  UNLOCK
+  /// Manual correction. Requires a reason; never used to paper over a bug.
+  ADJUSTMENT
+  /// Value destroyed by a burn (Module 11): debits a treasury wallet's
+  /// available balance and is counted exactly once in supply's burned figure.
+  /// Transfers, locks and adjustments are NOT burns and never use this value.
+  BURN
+}
+
+/// Where a transaction is in its lifecycle. FAILED and REVERSED exist so an
+/// accounting entry can record that it did not take effect, which is what makes
+/// a ledger reconcilable.
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REVERSED
+}
+
+/// Where a deposit is in its lifecycle.
+///
+/// PENDING covers a deposit that has been started but not yet paid for: the
+/// money is promised, not received, and the ledger has not been credited.
+/// SUCCEEDED is the only state in which the wallet holds the money.
+enum WalletDepositStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+/// Who is allowed to see a strategy.
+///
+/// PRIVATE is the default posture: a strategy belongs to its owner until the
+/// owner deliberately publishes it. There is no "unlisted" middle ground, because
+/// a third option would only be a name for one of these two.
+enum StrategyVisibility {
+  PRIVATE
+  PUBLIC
+}
+
+/// Lifecycle of a strategy.
+///
+/// Two states, one direction. ARCHIVED is terminal: a retired strategy is kept
+/// for reference and stays visible to its owner, but it cannot be edited and no
+/// operation returns it to ACTIVE. That is deliberate - a name that can be freed
+/// by archiving and immediately reused would let a follower who acted on the old
+/// strategy find a different one under the same name.
+enum StrategyStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+/// Direction of one simulated fill.
+///
+/// MODULE 06b. A simulation is long-only and all-in/all-out, so exactly two
+/// directions exist. It is a closed vocabulary rather than a free-text column
+/// so a row written by raw SQL cannot invent a side the engine never produces.
+enum FillSide {
+  BUY
+  SELL
+}
+
+/// Direction of one expert paper order.
+///
+/// MODULE 06c. Reuses the same two-direction vocabulary as `FillSide`.
+enum PaperOrderSide {
+  BUY
+  SELL
+}
+
+/// Lifecycle of one expert paper order.
+///
+/// MODULE 06c. `FILLED` is a committed market fill - a transaction the paper
+/// ledger applied atomically. `REJECTED` is a request that was refused for the
+/// documented reason on `reject_reason`, and that row is the record of the
+/// refusal so a history is never a silent gap.
+enum PaperOrderStatus {
+  FILLED
+  REJECTED
+}
+
+/// Why a paper order was refused.
+///
+/// MODULE 06c. The closed enumeration exists so a rejected row can never claim
+/// a reason the execution rules do not produce.
+enum PaperRejectReason {
+  /// No valid market price exists at all (feed disabled or empty).
+  MARKET_DATA_UNAVAILABLE
+  /// The last known price is older than its instrument's freshness threshold.
+  STALE_MARKET_DATA
+  /// Equities are outside the regular US session.
+  MARKET_CLOSED
+  /// A BUY whose gross cost exceeds the strategy's paper cash.
+  INSUFFICIENT_PAPER_CASH
+  /// A SELL of more paper quantity than the strategy holds.
+  INSUFFICIENT_POSITION
+}
+
+// ---------------------------------------------------------------------------
+// User
+// ---------------------------------------------------------------------------
+
+model User {
+  /// UUID primary key, generated by PostgreSQL.
+  id String @id @default(uuid()) @db.Uuid
+
+  /// Stable external identity in `provider:providerAccountId` form, for example
+  /// `google:109876543210`. Nullable so a user row is usable standalone (tests,
+  /// seed data) before an identity is linked. Unique: one application user per
+  /// external identity.
+  ///
+  /// Retained from Module 01 for compatibility. A user may sign in through more
+  /// than one provider, which a single column cannot express, so `AuthAccount`
+  /// below is the real link. This column mirrors the *first* linked identity and
+  /// stays authoritative only when the user has exactly one.
+  authUserId String? @unique @map("auth_user_id")
+
+  email String @unique
+
+  status UserStatus @default(ACTIVE)
+
+  /// Every OAuth identity linked to this user. Empty for rows created directly
+  /// by tests or seed data.
+  authAccounts AuthAccount[]
+
+  /// Every strategy this user owns (Module 05). A back-relation only: the
+  /// strategies table is reachable through its owner, so a user row cannot name
+  /// one that does not exist.
+  strategies Strategy[]
+
+  /// Every strategy this user follows (Module 07). Back-relation only: adding
+  /// it changes no column on `users`, which the schema assertions pin.
+  follows StrategyFollow[]
+
+  /// Every USDT exchange order this user has placed (Module 08). Back-relation
+  /// only: the `usdt_orders` table carries the follower column, so `users`
+  /// keeps exactly the columns the schema assertions pin.
+  usdtOrders UsdtOrder[]
+
+  /// This user's simulated liquidity-provider record (Module 09).
+  /// Back-relation only: the `liquidity_providers` table carries the column.
+  liquidityProvider LiquidityProvider?
+
+  /// EMBER transfers this user has sent or received (Module 10).
+  /// Back-relation only: the `ember_transfers` table carries the columns.
+  emberTransfersSent     EmberTransfer[] @relation("EmberTransfersSent")
+  emberTransfersReceived EmberTransfer[] @relation("EmberTransfersReceived")
+
+  /// Tokenomics simulation records this user created (Module 11). Back-relation
+  /// only: the `token_*` tables carry the columns, so `users` keeps exactly the
+  /// columns the schema assertions pin.
+  tokenAllocations TokenAllocation[]
+  tokenBuybacks    TokenBuyback[]
+  tokenBurns       TokenBurn[]
+
+  /// Blockchain layer: mints this user initiated and Hub/staking state.
+  emberMintRequests EmberMintRequest[]
+  emberPurchases    EmberPurchase[]
+  emberStakePositions EmberStakePosition[]
+
+  /// RBAC capability rows. Back-relation only.
+  roles UserRole[]
+
+  /// Role-grant requests this user submitted. Back-relation only.
+  roleRequests RoleRequest[]
+
+  /// Role-grant requests this user decided as an administrator. Back-relation only.
+  roleRequestsDecided RoleRequest[] @relation("RoleRequestsDecided")
+
+  /// Rows this user wrote to the admin audit log. Back-relation only.
+  adminAuditLogs AdminAuditLog[]
+
+  /// The user's onboarding profile and financial preferences (one row, 1:1).
+  profile UserProfile?
+
+  /// MODULE 14 - Sentinel. Back-relations only; child tables carry the columns.
+  sentinelAlerts SentinelAlert[]
+  sentinelVoiceSetting SentinelVoiceSetting?
+
+  /// Exactly one wallet per user for the prototype. The unique constraint on
+  /// Wallet.userId enforces the 1:1 relationship at the database level, so a
+  /// second wallet is rejected rather than merely discouraged.
+  wallet Wallet?
+
+  /// Every deposit this user made (Module 03b). Back-relation only: the
+  /// `wallet_deposits` table carries the user column.
+  walletDeposits WalletDeposit[]
+
+  /// timestamptz rather than a naive timestamp: the master plan requires UTC
+  /// timestamps internally, and a naive column silently reinterprets its value
+  /// in whatever session time zone happens to be set.
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("users")
+}
+
+// ---------------------------------------------------------------------------
+// Wallet
+// ---------------------------------------------------------------------------
+
+model Wallet {
+  id String @id @default(uuid()) @db.Uuid
+
+  userId String @unique @map("user_id") @db.Uuid
+
+  /// onDelete: Restrict - a user with a wallet cannot be deleted. Deletion is
+  /// deliberately blocked rather than cascading into financial state.
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  status WalletStatus @default(ACTIVE)
+
+  /// Current per-asset balances. Cascading is acceptable here because a
+  /// balance row is derived current state, not audit history.
+  balances WalletBalance[]
+
+  /// Immutable accounting history. Restrict protects this from cascading
+  /// deletion: dropping a wallet must not erase its ledger.
+  transactions Transaction[]
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("wallets")
+}
+
+// ---------------------------------------------------------------------------
+// Asset
+//
+// Generic reference data, not token logic. EMBER's on-chain representation and
+// USDT exchange behaviour belong to Modules 10 and 08 respectively.
+// ---------------------------------------------------------------------------
+
+model Asset {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// Canonical unique identifier, upper case by convention: INR, USDT, EMBER.
+  /// Lookups join on this rather than the id so seed data stays portable.
+  symbol String @unique
+
+  name String
+
+  kind AssetKind
+
+  /// Display precision for this asset (INR 2, USDT 6, EMBER 18). Presentation
+  /// only - storage precision is fixed by the NUMERIC(38,18) columns.
+  decimals Int @default(18)
+
+  /// Allows an asset to be retired for new activity without deleting its
+  /// history.
+  isActive Boolean @default(true) @map("is_active")
+
+  balances     WalletBalance[]
+  transactions Transaction[]
+  deposits     WalletDeposit[]
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("assets")
+}
+
+// ---------------------------------------------------------------------------
+// WalletBalance
+//
+// Current balances only. `total` is deliberately absent: later modules derive
+// total = available + locked. Storing it would create two sources of truth that
+// can disagree, and any fix for that disagreement belongs in an atomic update,
+// not in a column.
+// ---------------------------------------------------------------------------
+
+model WalletBalance {
+  id String @id @default(uuid()) @db.Uuid
+
+  walletId String @map("wallet_id") @db.Uuid
+  wallet   Wallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
+
+  assetId String @map("asset_id") @db.Uuid
+  /// Restrict - an asset referenced by a balance cannot be deleted.
+  asset   Asset  @relation(fields: [assetId], references: [id], onDelete: Restrict)
+
+  /// Spendable now.
+  available Decimal @default(0) @db.Decimal(38, 18)
+
+  /// Reserved: pledged, in-flight, or pending settlement. Not spendable.
+  locked Decimal @default(0) @db.Decimal(38, 18)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// One balance row per wallet per asset. Enforces the invariant that a
+  /// balance cannot be duplicated, which would otherwise make
+  /// "available" ambiguous.
+  @@unique([walletId, assetId], map: "wallet_balances_wallet_id_asset_id_key")
+  /// Supports asset-level aggregates (for example total EMBER supply), which
+  /// are not addressable through the composite unique index.
+  @@index([assetId], map: "wallet_balances_asset_id_idx")
+  @@map("wallet_balances")
+}
+
+// ---------------------------------------------------------------------------
+// Transaction
+//
+// Structure for future accounting; no accounting logic here. The balance
+// snapshots record the resulting state at the time of the movement, which is
+// what allows a later module to reconcile a wallet's history against its
+// current balance without recomputing every movement.
+// ---------------------------------------------------------------------------
+
+model Transaction {
+  id String @id @default(uuid()) @db.Uuid
+
+  walletId String @map("wallet_id") @db.Uuid
+  /// Restrict - a wallet with transaction history cannot be deleted.
+  wallet   Wallet @relation(fields: [walletId], references: [id], onDelete: Restrict)
+
+  assetId String @map("asset_id") @db.Uuid
+  /// Restrict - an asset referenced by a transaction cannot be deleted.
+  asset   Asset  @relation(fields: [assetId], references: [id], onDelete: Restrict)
+
+  type TransactionType
+
+  status TransactionStatus @default(PENDING)
+
+  /// Positive magnitude of the movement. Direction is derived from `type`
+  /// rather than encoded in the sign, so a stored negative can never be
+  /// mistaken for a credit. The database CHECK constraint rejects
+  /// non-positive amounts.
+  amount Decimal @db.Decimal(38, 18)
+
+  /// Wallet balances immediately after this transaction applied. Nullable
+  /// because a FAILED or REVERSED entry moves nothing.
+  availableAfter Decimal? @map("available_after") @db.Decimal(38, 18)
+  lockedAfter    Decimal? @map("locked_after") @db.Decimal(38, 18)
+
+  /// Human-readable justification. Required for ADJUSTMENT so a manual
+  /// correction is always attributable.
+  note String?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// Wallet history listing and pagination (Module 03), newest first.
+  @@index([walletId, createdAt(sort: Desc)], map: "transactions_wallet_id_created_at_idx")
+  /// Per-asset movement analysis, including supply reconciliation.
+  @@index([assetId, createdAt(sort: Desc)], map: "transactions_asset_id_created_at_idx")
+  @@map("transactions")
+}
+
+// ---------------------------------------------------------------------------
+// WalletDeposit - MODULE 03b
+//
+// A request to bring money into a wallet, and the record of whether it
+// arrived. It is not a ledger row: the money itself lands in `transactions`
+// as a DEPOSIT. This table is the *intent* and its outcome, kept separately so
+// that a payment that was started but never paid for leaves a trace instead of
+// nothing at all.
+// ---------------------------------------------------------------------------
+
+model WalletDeposit {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// The depositor. Restrict: a user with deposit history cannot be deleted,
+  /// because the record of what they paid for outlives the account.
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  /// The asset credited. INR for every deposit today; the column exists so a
+  /// future stablecoin deposit needs no new table.
+  assetId String @map("asset_id") @db.Uuid
+  asset   Asset  @relation(fields: [assetId], references: [id], onDelete: Restrict)
+
+  /// Positive magnitude, at the asset's own scale. The direction is a credit,
+  /// so the sign is never stored.
+  amount Decimal @db.Decimal(38, 18)
+
+  status WalletDepositStatus @default(PENDING)
+
+  /// Which rail carried the money: `manual` for the simulated rail, or
+  /// `razorpay` for the real gateway. Recorded so a deposit can always be
+  /// explained, and so a replay never takes a different rail than the first
+  /// attempt did.
+  provider String @default("manual")
+
+  /// The payment provider's own identifier for this payment, when there is
+  /// one. Unique, so a provider callback can never be applied to two deposits.
+  providerReference String? @unique @map("provider_reference")
+
+  /// Client-generated UUID that makes re-submission idempotent. Two requests
+  /// carrying the same key are one deposit, not two.
+  clientRequestId String @map("client_request_id")
+
+  /// Why this deposit exists, in one line. "Manual top-up" for the simulated
+  /// rail; the provider's order id for a gateway payment.
+  note String?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([userId, clientRequestId], map: "wallet_deposits_user_id_client_request_id_key")
+  @@index([userId, createdAt(sort: Desc)], map: "wallet_deposits_user_id_created_at_idx")
+  @@map("wallet_deposits")
+}
+
+// ---------------------------------------------------------------------------
+// AuthAccount - MODULE 02
+//
+// One OAuth identity belonging to a Prometheus user. Auth.js authenticates in
+// the Next.js app; this table is what lets the backend resolve the resulting
+// external identity to a Prometheus User.id.
+//
+// WHY THIS TABLE IS NECESSARY, given that User.authUserId already exists:
+//
+// A user can sign in with Google AND GitHub. Auth.js derives a different subject
+// for each (`google:123` and `github:456`) even when the email address is
+// identical, because the subject is scoped to the issuing provider. A single
+// authUserId column can therefore hold only one of them. The realistic second
+// login - same person, other provider - would find no matching authUserId, try
+// to create a second User, and collide with the unique constraint on email.
+//
+// This table resolves that without linking on email alone, which would be
+// unsafe: an email address is only verified by the provider, and two accounts
+// at different providers can legitimately share one. Linking is explicit.
+//
+// Deliberately NOT stored here: access tokens, refresh tokens or password
+// material. OAuth gives the application no user password, and a stolen row here
+// must not be enough to impersonate the user against the API - only a
+// Prometheus-signed access token is.
+// ---------------------------------------------------------------------------
+
+model AuthAccount {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// The Prometheus user this identity resolves to.
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// OAuth provider, lower case: `google` or `github`.
+  provider String
+
+  /// The provider's own identifier for the account: Google's `sub` claim or
+  /// GitHub's numeric user id. Only meaningful in combination with `provider`,
+  /// which is why the uniqueness constraint spans both.
+  providerAccountId String @map("provider_account_id")
+
+  /// Email as the provider reported it at login. Recorded for display and
+  /// diagnostics only. NEVER used to match or merge accounts: two provider
+  /// identities sharing an email string are not the same identity.
+  providerEmail String? @map("provider_email")
+
+  /// Free-form label so a user can tell their linked accounts apart.
+  label String?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// One identity maps to exactly one Prometheus user. This is what prevents a
+  /// duplicate user being created for the same provider login.
+  @@unique([provider, providerAccountId], map: "auth_accounts_provider_provider_account_id_key")
+  /// One account per provider per user: signing in twice with Google updates
+  /// the existing row rather than creating a near-duplicate.
+  @@unique([userId, provider], map: "auth_accounts_user_id_provider_key")
+  /// Resolving "which Prometheus user owns this identity?" is the single
+  /// hottest auth query; the composite unique above already covers it, so this
+  /// index exists for listing a user's linked accounts in provider order.
+  @@index([userId], map: "auth_accounts_user_id_idx")
+  @@map("auth_accounts")
+}
+
+// ---------------------------------------------------------------------------
+// Strategy - MODULE 05
+//
+// A named, owned description of how somebody trades, and nothing else.
+//
+// WHAT THIS ROW DELIBERATELY DOES NOT CONTAIN. That absence is the design, so it
+// is written down here rather than left to whoever adds the next column:
+//
+//  - No ROI, APY, Sharpe ratio, win rate, profit factor, drawdown, P&L or AUM.
+//    Prometheus has no price source and no performance history, so any of those
+//    figures would have to be invented. An invented return figure is worse than
+//    none: a user would size a position against it.
+//  - No follower count. Nothing here can count followers yet.
+//  - No risk level or risk score. That is the Risk Engine's job (Module 06), and
+//    it must be derived from something rather than declared by the owner.
+//  - No category or tags. No taxonomy exists to store them in.
+//  - No execution parameters (assets, sizes, entry/exit rules). Copy Trading
+//    (Module 07) and the execution engine define what a strategy may instruct;
+//    this module does not pre-empt them.
+//
+// The row therefore carries identity, ownership, visibility and lifecycle, and
+// nothing that would have to be kept in step with a computation done elsewhere.
+// ---------------------------------------------------------------------------
+
+model Strategy {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// The Prometheus user who owns this strategy. Always resolved from the
+  /// verified caller (`@CurrentUser`) - never read from a body or a parameter.
+  ownerId String @map("owner_id") @db.Uuid
+
+  /// onDelete: Restrict - a user who owns a strategy cannot be deleted. Modules
+  /// 06 and 07 will hang follow records and copy instructions off this owner, and
+  /// cascading here would let a deletion erase that history - the same reason the
+  /// wallet and ledger restrict.
+  owner User @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+
+  /// The strategy's name, stored as the owner wrote it (surrounding whitespace
+  /// removed) because it is displayed verbatim.
+  ///
+  /// Uniqueness is one name per owner, compared case-insensitively, enforced by a
+  /// functional unique index on `(owner_id, lower(name))` created in the
+  /// migration - Prisma's schema language cannot express one. No `@@unique` on
+  /// `name` is declared here on purpose: nothing in the application looks a
+  /// strategy up by name, and declaring one would advertise a lookup shape that
+  /// does not exist and would be read by the next migration run.
+  name String
+
+  /// Optional free-text explanation, also written by the owner.
+  description String?
+
+  /// PRIVATE unless the owner publishes it. Discovery reads PUBLIC + ACTIVE rows.
+  visibility StrategyVisibility @default(PRIVATE)
+
+  /// ACTIVE until archived. There is no unarchive.
+  status StrategyStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// MODULE 06b. A back-relation only: the simulation hangs off this row, so the
+  /// strategies table itself is unchanged - no column, no index, no constraint.
+  /// It exists because Prisma requires the parent side of a declared relation;
+  /// removing it would not remove the child table, only Prisma's ability to
+  /// describe it.
+  simulation StrategySimulation?
+
+  /// MODULE 06c. Back-relations for the paper ledger, exactly like `simulation`:
+  /// the child tables hang off this row and the strategies table is unchanged.
+  paperAccount   PaperAccount?
+  paperOrders    PaperOrder[]
+  paperPositions PaperPosition[]
+
+  /// MODULE 07. Back-relation only, for the same reason: `strategy_follows`
+  /// carries the follower column, so `strategies` keeps exactly the eight
+  /// columns the frozen schema assertion lists.
+  follows StrategyFollow[]
+
+  /// "My strategies", newest first - the ordering `GET /strategies/me` uses.
+  @@index([ownerId, createdAt(sort: Desc)], map: "strategies_owner_id_created_at_idx")
+  /// Discovery: PUBLIC + ACTIVE rows, newest first. Both filter columns lead,
+  /// because every discovery query names both.
+  @@index([visibility, status, createdAt(sort: Desc)], map: "strategies_visibility_status_created_at_idx")
+  @@map("strategies")
+}
+
+// ---------------------------------------------------------------------------
+// Module 06b - Historical market data, simulation and daily balance
+//
+// Four tables and nothing else. They exist to answer one question that Module
+// 06 cannot answer today: what was a strategy's equity on each day?
+//
+// NAMING IS CONSTRAINED BY DESIGN, NOT BY TASTE. Three of the project's frozen
+// schema assertions are properties of the *catalog*, so this module satisfies
+// them structurally rather than by editing them:
+//  - No column is named `id`. Every table uses a natural composite key (or the
+//    strategy reference itself), which is also the correct key for time-series
+//    data: there is exactly one candle per symbol per day and one balance per
+//    simulation per day, so a surrogate would only be a second name for the
+//    same fact.
+//  - No column is named `created_at` or `updated_at`. The timestamps here say
+//    what actually happened - when a row was imported, when a curve was
+//    computed - which is more informative than a lifecycle stamp anyway.
+//  - No table name contains `risk`, `equity` or `trade`. Risk stays Module
+//    06's vocabulary and Module 06 still owns every calculation; the word for
+//    what is stored here is a daily *balance*.
+//
+// Nothing here is a real trade, a real position or real money. `market_candles`
+// is genuine Binance Spot history; everything that hangs off a strategy is a
+// deterministic simulation over it.
+// ---------------------------------------------------------------------------
+
+/// One daily OHLCV bar for one symbol, imported from Binance Spot `1d` klines.
+///
+/// The primary key is the natural one: a symbol has exactly one bar per UTC
+/// day, so the pair is both the identity and the lookup the simulation uses.
+/// `day` is derived from the bar's open timestamp, which for this dataset is
+/// always exactly UTC midnight - see `kline-row.ts`.
+model MarketCandle {
+  /// Binance symbol as it appears in the archive path, e.g. `BTCUSDT`.
+  symbol String
+
+  /// The UTC calendar day the bar covers. DATE, not a timestamp: a day is the
+  /// unit of observation for both the simulation and Module 06.
+  day DateTime @db.Date
+
+  open  Decimal @db.Decimal(38, 18)
+  high  Decimal @db.Decimal(38, 18)
+  low   Decimal @db.Decimal(38, 18)
+  close Decimal @db.Decimal(38, 18)
+
+  /// Base-asset volume over the day.
+  volume Decimal @db.Decimal(38, 18)
+
+  /// Quote-asset volume over the day. Stored because it is free, exact, and the
+  /// only liquidity figure the source provides.
+  quoteVolume Decimal @map("quote_volume") @db.Decimal(38, 18)
+
+  /// When this row was written, not when the market moved.
+  importedAt DateTime @default(now()) @map("imported_at") @db.Timestamptz(3)
+
+  /// The archive the row came from, relative to the data root, so a suspicious
+  /// value can be traced back to a file that must not be edited.
+  sourceFile String @map("source_file")
+
+  @@id([symbol, day])
+  /// Cross-symbol queries: "what did every symbol do on this day".
+  @@index([day], map: "market_candles_day_idx")
+  @@map("market_candles")
+}
+
+/// The provenance record for one strategy's simulated curve.
+///
+/// Exactly one row per strategy: re-running a rule replaces it and cascades to
+/// its fills and daily balance. There is deliberately no run history - a second
+/// row would need a key of its own and a rule for deciding which one Module 06
+/// should read, and nothing needs to compare two runs yet.
+model StrategySimulation {
+  /// The strategy this simulation belongs to, and the primary key. One
+  /// simulation per strategy is the whole rule.
+  ///
+  /// onDelete: Restrict - the record of what produced a curve is history, so a
+  /// strategy cannot be deleted out from under it. No HTTP route deletes a
+  /// strategy at all, so this is reachable only from a test that cleans up in
+  /// dependency order.
+  strategyId String   @id @map("strategy_id") @db.Uuid
+  strategy   Strategy @relation(fields: [strategyId], references: [id], onDelete: Restrict)
+
+  /// Catalogue key of the rule, e.g. `sma-cross-eth`.
+  ruleKey String @map("rule_key")
+
+  /// Version of that rule. Bumping it is a code change with a test; storing it
+  /// means a curve read a year from now still says which algorithm made it.
+  ruleVersion Int @map("rule_version")
+
+  /// The single symbol the rule trades. This module is single-position by
+  /// design; a rotating multi-symbol rule would need a positions ledger.
+  symbol String
+
+  windowStart DateTime @map("window_start") @db.Date
+  windowEnd   DateTime @map("window_end") @db.Date
+
+  /// Paper starting cash. Never a real balance.
+  initialCash Decimal @map("initial_cash") @db.Decimal(38, 18)
+
+  /// The assumed fee rate. The dataset carries no fee data, so this is a stated
+  /// simulation assumption rather than a measurement - see `simulation/rules`.
+  feeRate Decimal @map("fee_rate") @db.Decimal(38, 18)
+
+  /// Row counts, so a reader can sanity-check a curve without counting it.
+  dayCount  Int @map("day_count")
+  fillCount Int @map("fill_count")
+
+  computedAt DateTime @default(now()) @map("computed_at") @db.Timestamptz(3)
+
+  fills        StrategyFill[]
+  dailyBalance StrategyDailyBalance[]
+
+  @@index([ruleKey], map: "strategy_simulations_rule_key_idx")
+  @@map("strategy_simulations")
+}
+
+/// One simulated fill: a paper order executed against a historical open.
+///
+/// `simulation_id` + `sequence_no` is the natural key. Sequence is assigned by
+/// the engine in chronological order, so replaying the same rule over the same
+/// candles reproduces byte-identical rows - there is no generated id to drift.
+///
+/// onDelete: Cascade - fills are derived output, exactly like a balance row.
+/// Deleting the simulation that produced them is the only way to replace them.
+model StrategyFill {
+  simulationId String @map("simulation_id") @db.Uuid
+  sequenceNo   Int    @map("sequence_no")
+
+  simulation StrategySimulation @relation(fields: [simulationId], references: [strategyId], onDelete: Cascade)
+
+  /// UTC calendar day the fill executed on - always the day *after* the signal.
+  fillDay DateTime @map("fill_day") @db.Date
+
+  side FillSide
+
+  symbol String
+
+  /// Base-asset quantity. Truncated to 8 decimal places by the engine, which is
+  /// the native precision of the source prices.
+  quantity Decimal @db.Decimal(38, 18)
+
+  /// The bar's open on `fillDay`. Never a mid-bar or next-bar-close price.
+  price Decimal @db.Decimal(38, 18)
+
+  /// quantity x price, before the fee.
+  gross Decimal @db.Decimal(38, 18)
+
+  /// gross x fee rate. An assumption, not a real commission.
+  fee Decimal @db.Decimal(38, 18)
+
+  /// Paper cash immediately after this fill, so the ledger can be replayed.
+  cashAfter Decimal @map("cash_after") @db.Decimal(38, 18)
+
+  /// Why the engine fired, in the rule's own words (`open`, `sma_cross_up`, ...).
+  note String?
+
+  @@id([simulationId, sequenceNo])
+  @@index([simulationId, fillDay], map: "strategy_fills_simulation_id_fill_day_idx")
+  @@map("strategy_fills")
+}
+
+/// One strategy's paper holdings and total value on one UTC day.
+///
+/// This is the only table Module 06 ever reads, through
+/// `PersistedDailyValueSeries`. Exactly one row per calendar day across the
+/// whole candle window, because `validateSeries` refuses a series with a gap -
+/// an absent day would describe a different history than the one claimed.
+///
+/// `value` is the number the Risk Engine measures. The columns beside it exist
+/// so the number can be explained: it is cash plus what the position was worth
+/// at that day's close, not a figure conjured from nowhere.
+///
+/// onDelete: Cascade - derived current state, like `wallet_balances`.
+model StrategyDailyBalance {
+  simulationId String   @map("simulation_id") @db.Uuid
+  day          DateTime @db.Date
+
+  simulation StrategySimulation @relation(fields: [simulationId], references: [strategyId], onDelete: Cascade)
+
+  /// Paper cash held overnight into this day.
+  cash Decimal @db.Decimal(38, 18)
+
+  /// Base-asset units held. Zero when flat.
+  positionQty Decimal @map("position_qty") @db.Decimal(38, 18)
+
+  /// positionQty x that day's close. Zero when flat.
+  positionValue Decimal @map("position_value") @db.Decimal(38, 18)
+
+  /// cash + positionValue. The equity-series value Module 06 consumes.
+  value Decimal @db.Decimal(38, 18)
+
+  computedAt DateTime @default(now()) @map("computed_at") @db.Timestamptz(3)
+
+  @@id([simulationId, day])
+  @@map("strategy_daily_balance")
+}
+
+// ---------------------------------------------------------------------------
+// Module 06c - Live market data and expert paper trading
+//
+// Three tables and nothing else. They hold the *paper* ledger of one expert
+// strategy: account, orders, positions. The live market values they refer to
+// are never persisted here - quotes and bars live in memory in `live-data` and
+// die with the process, which is why nothing in this block stores them.
+//
+// NAMING IS CONSTRAINED BY DESIGN, NOT BY TASTE, for the same three frozen
+// schema assertions Module 06b satisfies structurally rather than by editing:
+//  - No column is named `id`. `paper_accounts` is keyed by the strategy it
+//    belongs to, `paper_positions` by its natural (strategy, symbol) pair, and
+//    `paper_orders` by `order_id` - a surrogate that exists because orders are
+//    true records with no natural key, not a repetition of the banned name.
+//  - No column is named `created_at` or `updated_at`. The timestamps say what
+//    actually happened - when a position opened, when an order was placed,
+//    when an account was last touched - which is more informative than a
+//    lifecycle stamp anyway.
+//  - No table name contains `risk`, `equity` or `trade`: `paper_orders` is the
+//    name, and a follower (Module 07) will read *fills* through a port, never
+//    a table named after a trade.
+//
+// These are real amounts on paper and nothing more. Cash is denominated in USD
+// and starts at the same 100,000 that `DEFAULT_INITIAL_CASH` declares for a
+// simulation, but it is a paper balance: no row here touches `wallets`,
+// `transactions` or any Module 03 accounting, and no number here is a claim
+// about what happened to real money.
+// ---------------------------------------------------------------------------
+
+/// One expert strategy's paper wallet: cash, running realized P&L, provenance.
+///
+/// Exactly one row per strategy. It is created lazily on the first order (or
+/// first account read) and seeded with the module's paper starting cash.
+model PaperAccount {
+  /// The strategy this paper account belongs to, and the primary key. One
+  /// account per strategy is the whole rule.
+  strategyId String   @id @map("strategy_id") @db.Uuid
+  strategy   Strategy @relation(fields: [strategyId], references: [id], onDelete: Cascade)
+
+  /// Quote currency of every paper balance. USD for the eight-instrument
+  /// universe; kept as a column so a future quote-currency change is data,
+  /// not a rewrite of this comment.
+  currency String @default("USD")
+
+  /// Paper cash on hand, marked in USD. Never Module 03 money.
+  cash Decimal @default(100000) @db.Decimal(38, 18)
+
+  /// Accumulated realized P&L from closed (partial or full) SELLs, exact.
+  realizedPnl Decimal @default(0) @map("realized_pnl") @db.Decimal(38, 18)
+
+  /// First version of the account was provisioned.
+  openedAt DateTime @default(now()) @map("opened_at") @db.Timestamptz(3)
+
+  /// Last time any order mutated the account. Present from row 1 so an order
+  /// history screen can sort the account against recent fills.
+  lastActivityAt DateTime @map("last_activity_at") @db.Timestamptz(3)
+
+  @@map("paper_accounts")
+}
+
+/// One expert paper order: the request, its fill, or its rejection.
+///
+/// `order_id` is the surrogate key - every field the request carries could
+/// otherwise legitimately repeat, which is exactly why an order is a record and
+/// not a natural key. `order_id` is a UUID, which the frozen schema assertion
+/// calls for; it is only its *name* that must not be the banned `id`.
+///
+/// Idempotency: `(strategy_id, client_request_id)` is unique, so replaying the
+/// same client request either finds the original row (returned) or loses the
+/// insert race to the other request that owns it (translated to a read).
+model PaperOrder {
+  orderId String @id @default(uuid()) @map("order_id") @db.Uuid
+
+  strategyId String   @map("strategy_id") @db.Uuid
+  strategy   Strategy @relation(fields: [strategyId], references: [id], onDelete: Cascade)
+
+  /// Canonical instrument symbol from the eight-instrument catalogue,
+  /// e.g. `AAPL` or `BTC/USD`. Never the provider's spelling and never the
+  /// historical module's `BTCUSDT`.
+  symbol String
+
+  side PaperOrderSide
+
+  /// Base-asset quantity, truncated to the instrument's precision before use.
+  quantity Decimal @db.Decimal(38, 18)
+
+  /// FILLED after the paper ledger applied atomically; REJECTED with a reason.
+  status PaperOrderStatus @default(FILLED)
+
+  /// Why a REJECTED row was refused; null on FILLED.
+  rejectReason PaperRejectReason? @map("reject_reason")
+
+  /// The server-selected fill price (ask for BUY, bid for SELL), never
+  /// client-supplied. Null on REJECTED and irrelevant there.
+  fillPrice Decimal? @map("fill_price") @db.Decimal(38, 18)
+
+  /// When the request was accepted for evaluation.
+  placedAt DateTime @default(now()) @map("placed_at") @db.Timestamptz(3)
+
+  /// When the fill committed. Equal to `placed_at` for a market order; present
+  /// only when `status` is FILLED. This is the Module 07 copy-event timestamp.
+  filledAt DateTime? @map("filled_at") @db.Timestamptz(3)
+
+  /// Client-generated UUID that makes re-submission idempotent.
+  clientRequestId String @map("client_request_id")
+
+  /// Idempotent replay: one outstanding request per strategy.
+  @@unique([strategyId, clientRequestId], map: "paper_orders_strategy_id_client_request_id_key")
+  /// Order history, newest first.
+  @@index([strategyId, placedAt(sort: Desc)], map: "paper_orders_strategy_id_placed_at_idx")
+  /// Module 07 cursor reads: committed fills ordered by (filled_at, order_id).
+  @@index([strategyId, status, filledAt], map: "paper_orders_strategy_id_status_filled_at_idx")
+  @@map("paper_orders")
+}
+
+/// One expert strategy's current paper holding in one instrument.
+///
+/// Long-only and one row per instrument: a BUY upserts it, a SELL decrements
+/// it, and a SELL that empties it deletes the row - zero rows are never stored.
+/// `average_entry_price` is maintained exactly (weighted by quantity) so a
+/// partial SELL can compute realized P&L without replaying history.
+model PaperPosition {
+  strategyId String @map("strategy_id") @db.Uuid
+  symbol     String
+
+  strategy Strategy @relation(fields: [strategyId], references: [id], onDelete: Cascade)
+
+  /// Base-asset units held. Always strictly greater than zero.
+  quantity Decimal @db.Decimal(38, 18)
+
+  /// Quantity-weighted average entry price in the instrument's quote currency.
+  averageEntryPrice Decimal @map("average_entry_price") @db.Decimal(38, 18)
+
+  /// When this position first opened.
+  openedAt DateTime @default(now()) @map("opened_at") @db.Timestamptz(3)
+
+  /// When this position was last touched by a fill.
+  lastActivityAt DateTime @map("last_activity_at") @db.Timestamptz(3)
+
+  @@id([strategyId, symbol])
+  @@map("paper_positions")
+}
+
+// ---------------------------------------------------------------------------
+// Module 07 - Copy Trading Engine
+//
+// Four tables and nothing else. They hold the *follower's* side of a copy
+// relationship: who follows whom and at what allocation, that follower's own
+// simulated cash and holdings, and one row per expert fill that was consumed.
+//
+// NAMING IS CONSTRAINED BY DESIGN, NOT BY TASTE, for the same three frozen
+// schema assertions Modules 06b and 06c satisfy structurally rather than by
+// editing them:
+//  - No column is named `id`. Every table is keyed by its natural key:
+//    a follow by (follower, strategy), an event by (follower, strategy, expert
+//    order). That key is also the idempotency constraint the engine depends on,
+//    so a surrogate would be a second name for the same fact.
+//  - No column is named `created_at` or `updated_at`. The timestamps say what
+//    actually happened - when the follow started, when the cursor last moved,
+//    when an event was consumed - which is more informative than a lifecycle
+//    stamp anyway.
+//  - No table name contains `risk`, `equity` or `trade`. What is stored here is
+//    a *copy event* and a *position*, never a trade: nothing in this module
+//    touches a real venue, and the word "trade" is reserved for the tables a
+//    real order would belong to.
+//
+// SEPARATION OF MONEY. `copy_accounts` is a simulated balance owned by Module
+// 07. It is not the Module 03 wallet, it is not the Module 06c expert paper
+// account, and it is not Module 06b simulation state. No row here joins to any
+// of them: an expert's fill reaches a follower only through
+// `PaperExecutionPort`, by value, so the two ledgers cannot be made to
+// reconcile by accident.
+// ---------------------------------------------------------------------------
+
+/// Why a follow exists and whether it is still copying.
+///
+/// UNFOLLOWED is terminal for *copying* but not for the row: history, cash and
+/// positions stay readable, and the row is kept so re-following continues the
+/// same cursor rather than inventing a second relationship. There is no PAUSED
+/// state, because a paused follow would need a rule for which of the two
+/// "stopped copying" states a reader is looking at.
+enum FollowStatus {
+  ACTIVE
+  UNFOLLOWED
+}
+
+/// Outcome of one consumed expert fill.
+///
+/// REJECTED is a *recorded refusal*, not a missing row: an event that could not
+/// be copied still consumes the cursor and keeps a reason, so a history never
+/// contains a silent gap.
+enum CopyEventStatus {
+  COPIED
+  REJECTED
+}
+
+/// Why one expert fill was not copied.
+///
+/// The closed enumeration exists so a rejected row can never claim a reason the
+/// execution rules do not produce. Two classes live here and they behave
+/// differently, which is why both are named:
+///  - Eligibility and sizing reasons (`FOLLOW_NOT_ACTIVE`, `STRATEGY_ARCHIVED`,
+///    `STRATEGY_NOT_ELIGIBLE`, `ALLOCATION_ROUNDED_TO_ZERO`,
+///    `INSUFFICIENT_COPY_CASH`, `INSUFFICIENT_POSITION`,
+///    `PRICE_UNAVAILABLE`) are *terminal*: the event is consumed and is not
+///    retried, because nothing about the follower changes the answer.
+///  - Infrastructure failures are not a reason at all. They never produce a
+///    row: the transaction rolls back, the cursor does not move, and the event
+///    is retried on the next pass.
+enum CopyRejectReason {
+  /// The follow was unfollowed before this fill was consumed.
+  FOLLOW_NOT_ACTIVE
+  /// The expert strategy has been archived.
+  STRATEGY_ARCHIVED
+  /// The strategy is no longer PUBLIC and ACTIVE, so it is no longer eligible.
+  STRATEGY_NOT_ELIGIBLE
+  /// Expert quantity x allocation rounds down to zero at the 8-place precision.
+  ALLOCATION_ROUNDED_TO_ZERO
+  /// The follower's copy cash cannot fund even one unit of the scaled buy.
+  INSUFFICIENT_COPY_CASH
+  /// The follower holds none of the symbol, so there is nothing to sell.
+  INSUFFICIENT_POSITION
+  /// The expert fill carried no usable execution price to mirror.
+  PRICE_UNAVAILABLE
+}
+
+/// One follower's relationship with one expert strategy.
+///
+/// The primary key is the natural one: a user follows a strategy at most once,
+/// ever, which is what makes "duplicate follow" a constraint violation rather
+/// than a rule a later reader has to remember. Re-following flips `status` back
+/// to ACTIVE instead of inserting a second row, so the copy cursor, the cash
+/// account and the history all stay attached to the same relationship.
+model StrategyFollow {
+  /// The Prometheus user doing the following. Always the verified caller.
+  followerId String @map("follower_id") @db.Uuid
+  follower   User    @relation(fields: [followerId], references: [id], onDelete: Restrict)
+
+  /// The expert strategy being followed.
+  strategyId String   @map("strategy_id") @db.Uuid
+  strategy   Strategy @relation(fields: [strategyId], references: [id], onDelete: Restrict)
+
+  /// ACTIVE while copying, UNFOLLOWED afterwards. Set only by Module 07.
+  status FollowStatus @default(ACTIVE)
+
+  /// Portion of each expert order the follower mirrors, in (0, 1]. 1 means
+  /// "the same quantity as the expert"; anything above 1 is refused because it
+  /// would be leverage, and this module never levers a simulated account.
+  allocationFraction Decimal @map("allocation_fraction") @db.Decimal(38, 18)
+
+  /// When the current active interval began. Set again when a follower
+  /// re-follows, which is what makes a fill stamped before it - one committed
+  /// while the follower was not following - refused as FOLLOW_NOT_ACTIVE even
+  /// though the row is ACTIVE again by the time the engine reads it.
+  followedAt DateTime @default(now()) @map("followed_at") @db.Timestamptz(3)
+
+  /// When the current unfollow began. Null while ACTIVE, and cleared on
+  /// re-follow. The gap's fills are still walked and recorded by the engine;
+  /// they belong to no active interval, so each is stored as a refusal.
+  unfollowedAt DateTime? @map("unfollowed_at") @db.Timestamptz(3)
+
+  /// KEYSET CURSOR over the expert's committed fills, ordered by
+  /// (filled_at, order_id). Seeded at follow time to the frontier that already
+  /// exists then, so a follow copies the expert's *next* fill and never a fill
+  /// that predates it. Kept across an unfollow/re-follow cycle so the gap's
+  /// fills are consumed and recorded rather than dropped.
+  cursorFilledAt DateTime? @map("cursor_filled_at") @db.Timestamptz(3)
+  cursorOrderId String?    @map("cursor_order_id") @db.Uuid
+
+  /// When the engine last consumed an event for this follow. Null until the
+  /// first pass, which is how "processed" is told apart from "followed".
+  lastProcessedAt DateTime? @map("last_processed_at") @db.Timestamptz(3)
+
+  accounts  CopyAccount[]
+  positions CopyPosition[]
+  events    CopyEvent[]
+
+  /// A user follows a strategy at most once. This is the duplicate-follow rule.
+  @@id([followerId, strategyId])
+  /// The worker's scan: every ACTIVE follow for one strategy.
+  @@index([strategyId, status], map: "strategy_follows_strategy_id_status_idx")
+  /// "Strategies I follow", newest first.
+  @@index([followerId, followedAt(sort: Desc)], map: "strategy_follows_follower_id_followed_at_idx")
+  @@map("strategy_follows")
+}
+
+/// One follower's simulated copy cash for one followed strategy.
+///
+/// Exactly one row per follow, created lazily by the first *eligible* event the
+/// engine consumes - so a follow that has never executed anything has no
+/// account yet, and `null` is the honest answer rather than a zero balance.
+///
+/// The starting cash is a Module 07 constant, not the expert's: a follower's
+/// allocation is about how much of *their own* money tracks an order, and
+/// seeding it from the expert would couple two ledgers that must stay separate.
+/// Each follow gets its own pot, so unfollowing one strategy can never move the
+/// cash of another.
+model CopyAccount {
+  /// Part of the primary key: one account per follow, never one per user.
+  followerId String @map("follower_id") @db.Uuid
+  strategyId String @map("strategy_id") @db.Uuid
+
+  follow StrategyFollow @relation(fields: [followerId, strategyId], references: [followerId, strategyId], onDelete: Cascade)
+
+  /// Quote currency of this copy balance. USD, like the expert's paper ledger.
+  currency String @default("USD")
+
+  /// Simulated cash. Never Module 03 money and never a real balance.
+  cash Decimal @default(100000) @db.Decimal(38, 18)
+
+  /// Accumulated realized P&L from closed (partial or full) SELLs, exact.
+  realizedPnl Decimal @default(0) @map("realized_pnl") @db.Decimal(38, 18)
+
+  /// First version of the account was provisioned.
+  openedAt DateTime @default(now()) @map("opened_at") @db.Timestamptz(3)
+
+  /// Last time any copied fill moved this account.
+  lastActivityAt DateTime @map("last_activity_at") @db.Timestamptz(3)
+
+  @@id([followerId, strategyId])
+  @@map("copy_accounts")
+}
+
+/// One follower's holding in one instrument, for one followed strategy.
+///
+/// Long-only, one row per (follow, symbol), zero rows never stored - the same
+/// shape as the expert's `paper_positions`, deliberately: a follower's position
+/// that emptied out is absent, not a zero row that a reader has to filter.
+model CopyPosition {
+  followerId String @map("follower_id") @db.Uuid
+  strategyId String @map("strategy_id") @db.Uuid
+  symbol     String
+
+  follow StrategyFollow @relation(fields: [followerId, strategyId], references: [followerId, strategyId], onDelete: Cascade)
+
+  /// Base-asset units held. Always strictly greater than zero.
+  quantity Decimal @db.Decimal(38, 18)
+
+  /// Quantity-weighted average entry price, maintained exactly so a partial
+  /// SELL can compute realized P&L without replaying the event history.
+  averageEntryPrice Decimal @map("average_entry_price") @db.Decimal(38, 18)
+
+  openedAt DateTime @default(now()) @map("opened_at") @db.Timestamptz(3)
+
+  lastActivityAt DateTime @map("last_activity_at") @db.Timestamptz(3)
+
+  @@id([followerId, strategyId, symbol])
+  @@map("copy_positions")
+}
+
+/// One consumed expert fill for one follower: what was copied, or why not.
+///
+/// THE IDEMPOTENCY KEY IS THE PRIMARY KEY. `(follower, strategy, expert order)`
+/// means the same expert fill can be consumed exactly once per follower, no
+/// matter how many times a worker restarts, retries or races another worker:
+/// the second attempt finds the row instead of applying the fill twice. This is
+/// also why a rejected event is stored rather than thrown - the row *is* the
+/// record that the fill was seen and refused, and the cursor may move past it.
+model CopyEvent {
+  followerId String @map("follower_id") @db.Uuid
+  strategyId String @map("strategy_id") @db.Uuid
+  /// The Module 06c `paper_orders.order_id` this event mirrors. Not a relation:
+  /// Module 07 reads fills by *value* through `PaperExecutionPort` and must not
+  /// reference 06c's tables, so this is a plain UUID with no foreign key.
+  expertOrderId String @map("expert_order_id") @db.Uuid
+
+  follow StrategyFollow @relation(fields: [followerId, strategyId], references: [followerId, strategyId], onDelete: Restrict)
+
+  symbol String
+  side   PaperOrderSide
+
+  /// The expert's committed quantity and price, stored so a copied row can be
+  /// explained later without re-reading the expert's ledger. The price is
+  /// nullable because a fill the engine could not price is recorded as
+  /// PRICE_UNAVAILABLE with a null price - storing 0 would claim a price of
+  /// zero, which is a quote, not the absence of one.
+  expertQuantity  Decimal   @map("expert_quantity") @db.Decimal(38, 18)
+  expertFillPrice Decimal?  @map("expert_fill_price") @db.Decimal(38, 18)
+  expertFilledAt  DateTime  @map("expert_filled_at") @db.Timestamptz(3)
+
+  /// The allocation in force when this event was consumed. Snapshot rather than
+  /// a live join: the follower may change the fraction afterwards, and the
+  /// history must still explain the quantity that was actually taken.
+  allocationFraction Decimal @map("allocation_fraction") @db.Decimal(38, 18)
+
+  /// What the follower executed. Zero when REJECTED, so a refused row can never
+  /// be mistaken for a fill by a reader that forgets to check `status`.
+  quantity  Decimal   @default(0) @db.Decimal(38, 18)
+  fillPrice Decimal?  @map("fill_price") @db.Decimal(38, 18)
+  gross     Decimal?  @db.Decimal(38, 18)
+
+  status       CopyEventStatus
+  rejectReason CopyRejectReason? @map("reject_reason")
+
+  /// When the engine consumed this event. For a COPIED row this is the moment
+  /// the follower's ledger moved; for a REJECTED row, the moment it was refused.
+  processedAt DateTime @default(now()) @map("processed_at") @db.Timestamptz(3)
+
+  /// One outcome per expert fill per follower - the idempotency guarantee.
+  @@id([followerId, strategyId, expertOrderId])
+  /// Copied-order history for one follow, newest first.
+  @@index([followerId, strategyId, processedAt(sort: Desc)], map: "copy_events_follower_id_strategy_id_processed_at_idx")
+  /// Aggregates and status counts for one follow, grouped by outcome.
+  @@index([followerId, strategyId, status], map: "copy_events_follower_id_strategy_id_status_idx")
+  @@map("copy_events")
+}
+
+// ---------------------------------------------------------------------------
+// Module 08 - USDT Exchange
+//
+// One table and nothing else. It records a simulated USDT order: the side, the
+// exact amounts, the controlled demo prices that produced them, and the
+// reference-price savings metric - nothing more.
+//
+// NAMING IS CONSTRAINED BY DESIGN, NOT BY TASTE, for the same three frozen
+// schema assertions Modules 06b, 06c and 07 satisfy structurally rather than by
+// editing them:
+//  - No column is named `id`. Orders are true records with no natural key, so
+//    the surrogate is `order_id` - a UUID, whose *name* must not be the banned
+//    `id`.
+//  - No column is named `created_at` or `updated_at`. The timestamps say what
+//    actually happened - when the order was placed and when the settlement
+//    committed - which is more informative than a lifecycle stamp anyway.
+//  - No table name contains `risk`, `equity` or `trade`. What is stored here is
+//    a simulated exchange *order*, never a trade: nothing in this module
+//    touches a real venue, and the word "trade" is reserved for tables a real
+//    order would belong to.
+//
+// SEPARATION OF MONEY. Unlike the paper and copy ledgers, an order here moves
+// *Module 03 money*: the INR/USDT balance legs are applied through
+// `WalletService` and committed in the same database transaction as the order
+// row, so a row exists if and only if both balance movements committed. This
+// table never writes `wallet_balances` or `transactions` itself.
+//
+// IDEMPOTENCY IS A KEY, NOT A FLAG, exactly like `paper_orders`: `(user_id,
+// client_request_id)` is unique, so a replayed request finds the original row
+// instead of applying the balance movements a second time.
+//
+// There is deliberately no status or reject-reason column. Execution is
+// synchronous and atomic: a validation or balance failure rolls back and
+// leaves no row at all, so every stored row is by construction a filled order
+// and a second vocabulary would only describe a state no row can hold.
+// ---------------------------------------------------------------------------
+
+/// Which way one USDT exchange order moves.
+///
+/// The same two-direction vocabulary as the paper ledger, but its own enum:
+/// `PaperOrderSide` belongs to Module 06c's paper tables, and an exchange order
+/// is not a paper order.
+enum UsdtOrderSide {
+  BUY
+  SELL
+}
+
+/// One simulated USDT exchange order, settled atomically on creation.
+model UsdtOrder {
+  /// Surrogate key. A UUID generated by the server before the transaction
+  /// opens so the ledger notes of both balance legs can cite it.
+  orderId String @id @default(uuid()) @map("order_id") @db.Uuid
+
+  /// The verified caller who placed the order. Always resolved from
+  /// `@CurrentUser`, never read from a body or a parameter.
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  side UsdtOrderSide
+
+  /// USDT volume of the order, at the asset's display precision.
+  usdtAmount Decimal @map("usdt_amount") @db.Decimal(38, 18)
+
+  /// INR paid (BUY) or received (SELL) at the Prometheus price. Exact at the
+  /// INR scale - a conversion that cannot be represented to two decimal places
+  /// is refused rather than rounded.
+  inrAmount Decimal @map("inr_amount") @db.Decimal(38, 18)
+
+  /// The controlled demo price this order executed at, INR per USDT.
+  /// Snapshot rather than a live join: the constants are stated by the module,
+  /// and the history must still explain what was charged.
+  prometheusPrice Decimal @map("prometheus_price") @db.Decimal(38, 18)
+
+  /// The reference price the savings metric is measured against, INR per USDT.
+  referencePrice Decimal @map("reference_price") @db.Decimal(38, 18)
+
+  /// Customer savings against the reference price: volume x (reference -
+  /// prometheus), signed by side - positive when the customer is better off
+  /// than the reference, negative when worse off. A reference-price metric,
+  /// never cash, revenue or buyback funding.
+  savings Decimal @db.Decimal(38, 18)
+
+  /// Client-generated UUID that makes re-submission idempotent.
+  clientRequestId String @map("client_request_id")
+
+  /// When the request was accepted.
+  placedAt DateTime @default(now()) @map("placed_at") @db.Timestamptz(3)
+
+  /// When the settlement committed. Equal to `placed_at`: execution is
+  /// synchronous, and the row is written inside the same transaction as the
+  /// balance movements.
+  filledAt DateTime @default(now()) @map("filled_at") @db.Timestamptz(3)
+
+  /// Idempotent replay: one outstanding request per user.
+  @@unique([userId, clientRequestId], map: "usdt_orders_user_id_client_request_id_key")
+  /// Order history for one user, newest first - the listing GET /usdt/orders uses.
+  @@index([userId, placedAt(sort: Desc)], map: "usdt_orders_user_id_placed_at_idx")
+  @@map("usdt_orders")
+
+  /// Simulated LP allocation slices that funded this order (Module 09).
+  /// Back-relation only: the slices live on `liquidity_allocations`.
+  allocations LiquidityAllocation[]
+}
+
+// ---------------------------------------------------------------------------
+// Module 09 - Liquidity & Order Processing
+//
+// Simulated liquidity providers pledge USDT, gated by an EMBER lock sized by
+// configured slabs, and BUY orders draw their USDT from eligible commitments.
+// NOTHING here is real external liquidity: LP balances are Module 03 wallet
+// rows moved through WalletService, and the demo seed credits them with
+// clearly-labelled simulated funds.
+//
+// NAMING IS CONSTRAINED BY DESIGN, NOT BY TASTE, for the same three frozen
+// schema assertions Modules 06b, 06c, 07 and 08 satisfy structurally rather
+// than by editing them:
+//  - No column is named `id` - surrogates are `lp_id`, `commitment_id`,
+//    `allocation_id`, `reduction_id`, `top_up_request_id`.
+//  - No column is named `created_at` or `updated_at` - the timestamps say what
+//    actually happened (registered, committed, allocated, reduced, opened).
+//  - No table name contains `risk`, `equity` or `trade`.
+//
+// SEPARATION OF MONEY. Commitment rows never write `wallet_balances` or
+// `transactions` themselves: every EMBER lock/unlock and every USDT/INR order
+// leg goes through WalletService inside the caller's transaction, so a
+// commitment row and its lock commit together or not at all.
+//
+// CONCURRENCY is the guarded-update pattern: allocation and reduction both
+// carry `WHERE usdt_available >= <amount>`, so two racing operations cannot
+// both consume the same liquidity, and CHECK (>= 0) columns are the backstop.
+// ---------------------------------------------------------------------------
+
+/// Whether a simulated LP currently takes part in allocation.
+enum LiquidityProviderStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+/// Lifecycle of one LP's single commitment row.
+enum LiquidityCommitmentStatus {
+  ACTIVE
+  CLOSED
+}
+
+/// Shortfall notices raised when aggregate available liquidity runs low.
+enum LiquidityTopUpStatus {
+  OPEN
+  FULFILLED
+  CANCELLED
+}
+
+/// One simulated liquidity provider. Exactly one per user (unique user_id) and
+/// at most one open commitment row (unique lp_id on LiquidityCommitment).
+model LiquidityProvider {
+  /// Surrogate key.
+  lpId String @id @default(uuid()) @map("lp_id") @db.Uuid
+
+  /// The application user behind the LP. Always resolved from `@CurrentUser`
+  /// on the API path; seed data may create users directly.
+  userId String @unique @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  status LiquidityProviderStatus @default(ACTIVE)
+
+  /// When the user first registered as an LP.
+  registeredAt DateTime @default(now()) @map("registered_at") @db.Timestamptz(3)
+
+  commitment LiquidityCommitment?
+  @@map("liquidity_providers")
+}
+
+/// One LP's single USDT liquidity commitment.
+///
+/// Invariant maintained by the service: usdt_available = usdt_committed -
+/// usdt_consumed. `ember_locked` is the EMBER currently held for THIS
+/// commitment; order consumption never touches it, reductions recompute the
+/// slab requirement and unlock only the surplus.
+model LiquidityCommitment {
+  /// Surrogate key.
+  commitmentId String @id @default(uuid()) @map("commitment_id") @db.Uuid
+
+  /// The LP this commitment belongs to. One commitment per LP.
+  lpId String @unique @map("lp_id") @db.Uuid
+  lp   LiquidityProvider @relation(fields: [lpId], references: [lpId], onDelete: Restrict)
+
+  /// Total pledged USDT. This - not the available figure - is what the EMBER
+  /// slab is evaluated against (commitment-based locking).
+  usdtCommitted Decimal @map("usdt_committed") @db.Decimal(38, 18)
+
+  /// Cumulative USDT delivered to customer BUY orders from this commitment.
+  usdtConsumed Decimal @default(0) @map("usdt_consumed") @db.Decimal(38, 18)
+
+  /// Allocatable remainder: committed - consumed. Guarded updates on this
+  /// column are the allocation/reduction concurrency control.
+  usdtAvailable Decimal @map("usdt_available") @db.Decimal(38, 18)
+
+  /// EMBER currently locked in the LP's wallet for this commitment.
+  emberLocked Decimal @default(0) @map("ember_locked") @db.Decimal(38, 18)
+
+  status LiquidityCommitmentStatus @default(ACTIVE)
+
+  /// Client-generated UUID of the most recent create/increase request. Kept on
+  /// the row so a replayed request is recognised and returned as-is instead of
+  /// being applied twice (mirrors the reduction ledger's own key).
+  clientRequestId String @map("client_request_id") @db.Uuid
+
+  committedAt DateTime @default(now()) @map("committed_at") @db.Timestamptz(3)
+  closedAt    DateTime? @map("closed_at") @db.Timestamptz(3)
+
+  allocations  LiquidityAllocation[]
+  reductions   LiquidityCommitmentReduction[]
+
+  /// Allocation reads commitments oldest-first.
+  @@index([status, committedAt], map: "liquidity_commitments_status_committed_at_idx")
+  @@map("liquidity_commitments")
+}
+
+/// One slice of a customer BUY order funded by one LP commitment.
+model LiquidityAllocation {
+  /// Surrogate key.
+  allocationId String @id @default(uuid()) @map("allocation_id") @db.Uuid
+
+  /// The commitment the liquidity came from.
+  commitmentId String @map("commitment_id") @db.Uuid
+  commitment   LiquidityCommitment @relation(fields: [commitmentId], references: [commitmentId], onDelete: Restrict)
+
+  /// The customer order this slice funded. Created in the same transaction,
+  /// so the FK can be a real reference.
+  orderId String @map("order_id") @db.Uuid
+  order   UsdtOrder @relation(fields: [orderId], references: [orderId], onDelete: Restrict)
+
+  /// USDT this LP delivered.
+  usdtAmount Decimal @map("usdt_amount") @db.Decimal(38, 18)
+
+  /// Execution price the slice settled at, INR per USDT - the order's
+  /// prometheusPrice, so customer and LP legs agree to the paisa.
+  priceInr Decimal @map("price_inr") @db.Decimal(38, 18)
+
+  allocatedAt DateTime @default(now()) @map("allocated_at") @db.Timestamptz(3)
+
+  /// One slice per commitment per order: re-applying an allocation is a bug.
+  @@unique([orderId, commitmentId], map: "liquidity_allocations_order_id_commitment_id_key")
+  @@map("liquidity_allocations")
+}
+
+/// One idempotent commitment reduction (LP withdrawal).
+model LiquidityCommitmentReduction {
+  /// Surrogate key.
+  reductionId String @id @default(uuid()) @map("reduction_id") @db.Uuid
+
+  /// The commitment that shrank.
+  commitmentId String @map("commitment_id") @db.Uuid
+  commitment   LiquidityCommitment @relation(fields: [commitmentId], references: [commitmentId], onDelete: Restrict)
+
+  /// USDT removed from the commitment. Never exceeds usdt_available.
+  usdtAmount Decimal @map("usdt_amount") @db.Decimal(38, 18)
+
+  /// EMBER released back to the LP's available balance by this reduction
+  /// (the surplus above the new slab requirement). Zero when the slab did not
+  /// change.
+  emberUnlocked Decimal @map("ember_unlocked") @db.Decimal(38, 18)
+
+  /// Client-generated UUID that makes re-submission idempotent.
+  clientRequestId String @map("client_request_id") @db.Uuid
+
+  reducedAt DateTime @default(now()) @map("reduced_at") @db.Timestamptz(3)
+
+  /// Idempotent replay: one outcome per reduction request.
+  @@unique([commitmentId, clientRequestId], map: "liquidity_reductions_commitment_client_request_key")
+  @@map("liquidity_commitment_reductions")
+}
+
+/// A persisted liquidity shortfall notice. Created by the overview read when
+/// aggregate available liquidity sits at or below the configured threshold.
+/// It never moves funds and never selects an LP - fulfilling it is a normal
+/// commitment increase by whichever LP chooses to act.
+model LiquidityTopUpRequest {
+  /// Surrogate key.
+  topUpRequestId String @id @default(uuid()) @map("top_up_request_id") @db.Uuid
+
+  /// Shortfall observed when the request opened (threshold - aggregate).
+  requiredUsdt Decimal @map("required_usdt") @db.Decimal(38, 18)
+
+  /// The configured threshold at the time of detection.
+  thresholdUsdt Decimal @map("threshold_usdt") @db.Decimal(38, 18)
+
+  status LiquidityTopUpStatus @default(OPEN)
+
+  openedAt  DateTime @default(now()) @map("opened_at") @db.Timestamptz(3)
+  resolvedAt DateTime? @map("resolved_at") @db.Timestamptz(3)
+
+  /// The open-request list, oldest first.
+  @@index([status, openedAt], map: "liquidity_top_up_requests_status_opened_at_idx")
+  @@map("liquidity_top_up_requests")
+}
+
+// ---------------------------------------------------------------------------
+// EmberTransfer - MODULE 10
+//
+// One user-to-user EMBER movement. The money still moves exclusively through
+// WalletService (sender TRANSFER_OUT debit, recipient TRANSFER_IN credit),
+// both legs inside the same transaction that inserts this row - so a row
+// exists if and only if both balance legs committed. This table is the
+// idempotency ledger and the audit trail; it is never a second balance.
+//
+// `client_request_id` is unique per SENDER (not globally): two users may
+// independently generate the same UUID, but one user re-sending their own
+// key with a different payload is a conflict the service must refuse.
+// ---------------------------------------------------------------------------
+
+/// One user-to-user EMBER transfer (Module 10).
+model EmberTransfer {
+  /// Surrogate key.
+  transferId String @id @default(uuid()) @map("transfer_id") @db.Uuid
+
+  /// The user whose available EMBER was debited.
+  senderUserId String @map("sender_user_id") @db.Uuid
+  senderUser   User   @relation("EmberTransfersSent", fields: [senderUserId], references: [id], onDelete: Restrict)
+
+  /// The user whose wallet was credited. Restrict: a transfer with history
+  /// cannot be orphaned by deleting either party.
+  recipientUserId String @map("recipient_user_id") @db.Uuid
+  recipientUser   User   @relation("EmberTransfersReceived", fields: [recipientUserId], references: [id], onDelete: Restrict)
+
+  /// EMBER moved. Positive magnitude; direction is the leg types, never the sign.
+  amount Decimal @db.Decimal(38, 18)
+
+  /// Client-generated UUID. Unique per sender: one transfer outcome per
+  /// (sender, request) pair, exactly like Module 08's orders.
+  clientRequestId String @map("client_request_id") @db.Uuid
+
+  transferredAt DateTime @default(now()) @map("transferred_at") @db.Timestamptz(3)
+
+  /// Idempotent replay: one outcome per sender request.
+  @@unique([senderUserId, clientRequestId], map: "ember_transfers_sender_client_request_key")
+  /// Per-side history, newest first.
+  @@index([senderUserId, transferredAt(sort: Desc)], map: "ember_transfers_sender_transferred_at_idx")
+  @@index([recipientUserId, transferredAt(sort: Desc)], map: "ember_transfers_recipient_transferred_at_idx")
+  @@map("ember_transfers")
+}
+
+// ---------------------------------------------------------------------------
+// Module 11 - EMBER tokenomics
+//
+// Three record tables and nothing that moves money on its own. A configured
+// allocation splits a reference amount 60/40 (direct burn / buyback); a
+// buyback record walks SIMULATED -> RECORDED_SIMULATED_EXECUTION; a burn
+// record is the ONLY row that destroys EMBER, and it does so by debiting the
+// treasury wallet's available balance with a BURN ledger leg through
+// WalletService inside the same transaction - so a burn row exists if and
+// only if the ledger destruction committed. Actual (funded, venue-executed)
+// buybacks are deliberately absent: the architecture models no price venue,
+// no buyback funding and no exchange settlement, so nothing here may claim
+// one. The reference amounts are reference-price metrics, never cash or
+// funding - the same posture as `usdt_orders.savings`.
+//
+// NAMING IS CONSTRAINED BY DESIGN, NOT BY TASTE, for the same frozen schema
+// assertions Modules 06b-10 satisfy structurally rather than by editing them:
+//  - No column is named `id` - surrogates are `allocation_id`, `buyback_id`,
+//    `burn_id`.
+//  - No column is named `created_at` or `updated_at` - the timestamps say
+//    what actually happened (allocated, simulated, executed, burned).
+//  - No table name contains `risk`, `equity` or `trade`.
+//
+// IDEMPOTENCY IS A KEY, NOT A FLAG: `(user_id, client_request_id)` is unique
+// on each table, so a replayed request finds the original row instead of
+// writing a second record. A buyback additionally has one row per allocation
+// (`allocation_id` unique), and a burn one row per executed buyback
+// (`buyback_id` unique) - together those two constraints make double-counting
+// impossible even across different callers.
+//
+// SUPPLY RECONCILIATION relies on the ledger, not on these tables: supply's
+// burned figure is SUM(BURN) over `transactions` (Module 10 reads it), and
+// every burn writes exactly one BURN leg of the same amount. Allocation and
+// buyback rows move no balances at all, so by construction they change no
+// supply figure; a burn-after-buyback is one burn row referencing its
+// buyback, never two burns for the same execution.
+// ---------------------------------------------------------------------------
+
+/// Where a burn's EMBER came from. Both sources are real ledger destruction;
+/// the distinction records provenance, not a difference in accounting.
+enum TokenBurnSource {
+  /// Treasury-controlled EMBER burned directly, without a buyback.
+  DIRECT
+  /// EMBER attributed to a recorded simulated buyback execution.
+  BUYBACK
+}
+
+/// How far a simulated buyback has progressed.
+///
+/// Only two states exist because only two states are true. ACTUAL execution is
+/// deliberately not a value: no price venue, funding or settlement record
+/// exists, so an "actual" status could only ever be a claim nothing can back.
+enum TokenBuybackStatus {
+  /// Proposed against the allocation's reference price; nothing executed.
+  SIMULATED
+  /// A simulated execution was recorded (executed price and quantity set).
+  /// Still simulated: it moves no balances and funds nothing.
+  RECORDED_SIMULATED_EXECUTION
+}
+
+/// One proposed allocation of a reference amount across the configured
+/// direct-burn / buyback split (Module 11). Immutable once written: the
+/// percentage and price snapshots explain the arithmetic for all time, and
+/// buybacks join this row rather than copying its figures.
+model TokenAllocation {
+  /// Surrogate key.
+  allocationId String @id @default(uuid()) @map("allocation_id") @db.Uuid
+
+  /// The caller who recorded the proposal. Read models list per caller.
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  /// Reference amount (INR) the split is computed from. A reference-price
+  /// metric, never cash, revenue or buyback funding.
+  referenceAmount Decimal @map("reference_amount") @db.Decimal(38, 18)
+
+  /// The illustrative EMBER price (INR per EMBER) the quantities were derived
+  /// at. Caller-chosen and illustrative - no price feed exists.
+  emberPrice Decimal @map("ember_price") @db.Decimal(38, 18)
+
+  /// Percentage snapshot taken from configuration at proposal time, so a
+  /// later config change cannot rewrite what this record meant.
+  directBurnPct Int @map("direct_burn_pct")
+  buybackPct    Int @map("buyback_pct")
+
+  /// Split of the reference amount, exact at INR scale (2dp): the direct
+  /// portion is rounded HALF_UP to 2dp and the buyback is the remainder, so
+  /// the two always sum to referenceAmount without drift.
+  directBurnInr Decimal @map("direct_burn_inr") @db.Decimal(38, 18)
+  buybackInr    Decimal @map("buyback_inr") @db.Decimal(38, 18)
+
+  /// EMBER each portion could buy at emberPrice, floored to 18dp so a
+  /// quantity never exceeds what its portion funds.
+  directBurnEmber Decimal @map("direct_burn_ember") @db.Decimal(38, 18)
+  buybackEmber    Decimal @map("buyback_ember") @db.Decimal(38, 18)
+
+  /// Client-generated UUID that makes re-submission idempotent.
+  clientRequestId String @map("client_request_id") @db.Uuid
+
+  /// When the proposal was accepted.
+  allocatedAt DateTime @default(now()) @map("allocated_at") @db.Timestamptz(3)
+
+  /// Idempotent replay: one proposal per caller request.
+  @@unique([userId, clientRequestId], map: "token_allocations_user_client_request_key")
+  /// History for one caller, newest first - the listing GET /tokenomics/records uses.
+  @@index([userId, allocatedAt(sort: Desc)], map: "token_allocations_user_allocated_at_idx")
+  @@map("token_allocations")
+
+  /// The simulated buybacks proposed against this allocation. Back-relation:
+  /// `token_buybacks.allocation_id` is unique, so an allocation has at most one.
+  buybacks TokenBuyback[]
+}
+
+/// One simulated EMBER buyback proposed from an allocation's buyback portion
+/// (Module 11). Creation moves nothing; recording an execution also moves
+/// nothing - both are simulation records. Only a burn row (below) destroys
+/// EMBER, and never more than the recorded executed quantity.
+model TokenBuyback {
+  /// Surrogate key.
+  buybackId String @id @default(uuid()) @map("buyback_id") @db.Uuid
+
+  /// The allocation this buyback draws its portion from. Unique: one buyback
+  /// per allocation, so the same proposal cannot be bought back twice.
+  allocationId String @map("allocation_id") @db.Uuid
+  allocation   TokenAllocation @relation(fields: [allocationId], references: [allocationId], onDelete: Restrict)
+
+  /// The caller who recorded this buyback.
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  status TokenBuybackStatus @default(SIMULATED)
+
+  /// Client-generated UUID of the CREATE request.
+  clientRequestId String @map("client_request_id") @db.Uuid
+
+  /// When the simulated buyback was proposed.
+  simulatedAt DateTime @default(now()) @map("simulated_at") @db.Timestamptz(3)
+
+  /// The price the simulated execution was recorded at (INR per EMBER).
+  /// Null until an execution is recorded; null status-distinguishes the two
+  /// lifecycle stages rather than a boolean flag.
+  executedPrice Decimal? @map("executed_price") @db.Decimal(38, 18)
+
+  /// EMBER the buyback portion funds at executedPrice, floored to 18dp.
+  /// Null until recorded; a burn can only reference a row that has it.
+  executedEmber Decimal? @map("executed_ember") @db.Decimal(38, 18)
+
+  /// When the simulated execution was recorded.
+  executedAt DateTime? @map("executed_at") @db.Timestamptz(3)
+
+  /// Idempotent replay of the create: one buyback per caller request.
+  @@unique([userId, clientRequestId], map: "token_buybacks_user_client_request_key")
+  /// One buyback per allocation, enforced at the database level.
+  @@unique([allocationId], map: "token_buybacks_allocation_id_key")
+  /// History for one caller, newest first.
+  @@index([userId, simulatedAt(sort: Desc)], map: "token_buybacks_user_simulated_at_idx")
+  @@map("token_buybacks")
+
+  /// The burn that destroyed this buyback's executed quantity, if any.
+  /// Back-relation: `token_burns.buyback_id` is unique, so at most one - the
+  /// database is what prevents burning one execution twice.
+  burn TokenBurn?
+}
+
+/// One completed EMBER burn (Module 11): the row that actually destroys
+/// supply. Written in the same transaction as a BURN debit of the treasury
+/// wallet's available balance, so the record and the ledger destruction
+/// commit together or not at all. supply.burnedSupply is SUM(BURN) over the
+/// ledger, which reconciles 1:1 with this table by construction.
+model TokenBurn {
+  /// Surrogate key.
+  burnId String @id @default(uuid()) @map("burn_id") @db.Uuid
+
+  /// The caller who recorded the burn. No RBAC exists in the codebase, so
+  /// any authenticated caller may record one; the treasury itself is not a
+  /// caller but the wallet every burn debits.
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  source TokenBurnSource
+
+  /// Set for BUYBACK burns: the executed buyback whose quantity was burned.
+  /// Unique - one burn per execution. Null for DIRECT burns.
+  buybackId String? @unique @map("buyback_id") @db.Uuid
+  buyback   TokenBuyback? @relation(fields: [buybackId], references: [buybackId], onDelete: Restrict)
+
+  /// EMBER destroyed, at full ledger precision. For a BUYBACK burn this
+  /// equals the referenced buyback's executedEmber exactly.
+  amount Decimal @db.Decimal(38, 18)
+
+  /// Client-generated UUID that makes re-submission idempotent.
+  clientRequestId String @map("client_request_id") @db.Uuid
+
+  /// When the burn committed - equal to the ledger leg's timestamp.
+  burnedAt DateTime @default(now()) @map("burned_at") @db.Timestamptz(3)
+
+  /// Idempotent replay: one burn per caller request.
+  @@unique([userId, clientRequestId], map: "token_burns_user_client_request_key")
+  /// History for one caller, newest first.
+  @@index([userId, burnedAt(sort: Desc)], map: "token_burns_user_burned_at_idx")
+  @@map("token_burns")
+
+  /// Blockchain layer state for this burn. NOT_REQUIRED while the blockchain
+  /// layer is disabled (staffed local/off-chain operation); the movement to
+  /// on-chain status never changes the burn's ledger effect - the ledger leg
+  /// is accountable regardless of what the chain reports.
+  onChainStatus OnChainStatus @default(NOT_REQUIRED) @map("on_chain_status")
+
+  /// Hash of the burnTreasury transaction submitted for this burn. Null until
+  /// the transaction is broadcast. One burn carries at most one on-chain burn
+  /// transaction by construction.
+  onChainTxHash String? @unique @map("on_chain_tx_hash")
+
+  /// Block the confirmed burn transaction was mined in.
+  onChainBlockNumber BigInt? @map("on_chain_block_number")
+
+  onChainUpdatedAt DateTime? @map("on_chain_updated_at") @db.Timestamptz(3)
+
+  /// The ingested TokensBurned event for this burn, when the burn was
+  /// propagated on-chain.
+  onChainEvent BlockchainEvent?
+}
+
+// ---------------------------------------------------------------------------
+// Blockchain layer - EMBER token, minting, event ingestion (Module 13+)
+//
+// Two tables here plus columns on token_burns. The mint lifecycle table is
+// the operator-facing audit trail and the idempotency boundary for a minting
+// operation that spans the backend database and the EVM chain; the events
+// table is the deduplicated ingestion record for contract events.
+// ---------------------------------------------------------------------------
+
+/// Lifecycle of one authorized mint request.
+enum EmberMintStatus {
+  /// Accepted and persisted, not yet broadcast on-chain.
+  PENDING
+  /// Broadcast; the transaction hash is recorded.
+  SUBMITTED
+  /// Transaction mined successfully and event ingested.
+  CONFIRMED
+  /// Transaction reverted, was dropped, or the request became unrecoverable.
+  FAILED
+}
+
+/// How far a tokenomics or inventory operation has progressed on-chain. NOT_REQUIRED
+/// exists so rows written before the blockchain layer (or while it is off)
+/// do not pretend to have a chain state.
+enum OnChainStatus {
+  NOT_REQUIRED
+  PENDING
+  SUBMITTED
+  CONFIRMED
+  FAILED
+}
+
+/// The two contract events that map to backend operations.
+enum BlockchainEventType {
+  TokensMinted
+  TokensBurned
+}
+
+/// One authorized EMBER mint request, orchestrated end-to-end.
+///
+/// Exactly one request per requestId; the same key submitted again replays
+/// the original row's state, so a retry after a timeout cannot double-mint.
+/// The status transitions are one-way and only ever recorded by the module
+/// that submits the transaction - this row is an audit trail plus idempotency
+/// boundary, never a balance.
+model EmberMintRequest {
+  /// Surrogate key.
+  mintRequestId String @id @default(uuid()) @map("mint_request_id") @db.Uuid
+
+  /// Client-generated UUID. Unique globally: one mint outcome per request key.
+  requestId String @unique @db.Uuid
+
+  /// EMBER to mint, at ledger precision. Always credited to the treasury
+  /// wallet ledger AND owned by the treasury address on-chain.
+  amount Decimal @db.Decimal(38, 18)
+
+  status EmberMintStatus @default(PENDING)
+
+  /// The platform administrator who initiated the request.
+  requestedBy String @map("requested_by") @db.Uuid
+  requestedByUser User @relation(fields: [requestedBy], references: [id], onDelete: Restrict)
+
+  /// Free-text context for the audit trail.
+  reason String?
+
+  network String
+  chainId Int
+
+  txHash String? @map("tx_hash")
+
+  /// Block the confirmed mint transaction was mined in.
+  blockNumber BigInt? @map("block_number")
+
+  errorMessage String? @map("error_message")
+
+  requestedAt DateTime @default(now()) @map("requested_at") @db.Timestamptz(3)
+  confirmedAt DateTime? @map("confirmed_at") @db.Timestamptz(3)
+  failedAt DateTime? @map("failed_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// The ledger-side counterpart of pending mints is deliberately absent:
+  /// a PENDING or SUBMITTED request has moved nothing in PostgreSQL - the
+  /// only ledger credit happens when the operator's reconciliation run
+  /// (authorized, explicit) writes a qualifying DEPOSIT against a
+  /// CONFIRMED mint event. This keeps the ledger append-only from the
+  /// backend's own perspective.
+  events BlockchainEvent[]
+
+  @@index([status, requestedAt], map: "ember_mint_requests_status_requested_at_idx")
+  @@map("ember_mint_requests")
+}
+
+/// One ingested, deduplicated contract event.
+///
+/// sourceT is the de-duplication key: (chainId, txHash, logIndex) is unique,
+/// so reprocessing an already-ingested block range or a replayed
+/// reconciliation becomes a no-op. A row is linked to exactly one backend
+/// operation by the unique mintRequestId or burnId columns.
+model BlockchainEvent {
+  id String @id @default(uuid()) @db.Uuid
+
+  network String
+  chainId Int
+
+  txHash String @map("tx_hash")
+  blockNumber BigInt @map("block_number")
+  logIndex Int @map("log_index")
+
+  eventType BlockchainEventType @map("event_type")
+
+  /// Decoded event arguments, as submitted to the chain.
+  payload Json
+
+  /// EMBER magnitude carried by the event, at ledger precision - what the
+  /// reporting queries aggregate without decoding the payload.
+  amount Decimal @db.Decimal(38, 18)
+
+  /// The treasury/user address element of the event (indexed account).
+  account String
+
+  /// The mint request this event confirms, when it originates from the
+  /// platform's own minting.
+  mintRequestId String? @unique @map("mint_request_id") @db.Uuid
+  mintRequest    EmberMintRequest? @relation(fields: [mintRequestId], references: [mintRequestId], onDelete: SetNull)
+
+  /// The burn this event confirms, when it originates from a platform burn.
+  burnId String? @unique @db.Uuid
+  burn   TokenBurn? @relation(fields: [burnId], references: [burnId], onDelete: SetNull)
+
+  processedAt DateTime @default(now()) @map("processed_at") @db.Timestamptz(3)
+
+  /// Deduplication: one row per on-chain event occurrence.
+  @@unique([chainId, txHash, logIndex], map: "blockchain_events_chain_tx_log_key")
+  @@index([eventType, blockNumber], map: "blockchain_events_type_block_idx")
+  @@map("blockchain_events")
+}
+
+// ---------------------------------------------------------------------------
+// EMBER Hub - treasury distribution (Module 13+)
+// ---------------------------------------------------------------------------
+
+enum EmberPurchaseStatus {
+  COMPLETED
+  FAILED
+}
+
+/// One completed EMBER purchase from treasury inventory through the Hub.
+///
+/// A purchase is an internal transfer: treasury EMBER -> user EMBER and user
+/// USDT -> treasury USDT, both legs written by WalletService inside one
+/// transaction together with this row. It is never a mint; on-chain supply
+/// does not change because a transfer happens. PENDING is deliberately
+/// absent: a purchase is atomic, so a row exists completed or it does not
+/// exist at all (FAILED rows record refusals that partially failed
+/// instrumentally, which the service verifies cannot happen).
+model EmberPurchase {
+  /// Surrogate key.
+  purchaseId String @id @default(uuid()) @map("purchase_id") @db.Uuid
+
+  /// The user whose wallet received the EMBER and paid USDT.
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  /// EMBER moved from treasury inventory to the user.
+  emberAmount Decimal @map("ember_amount") @db.Decimal(38, 18)
+
+  /// The configured hub baseline price, INR per EMBER.
+  emberPriceInr Decimal @map("ember_price_inr") @db.Decimal(38, 18)
+
+  /// The total the user paid, at INR scale.
+  totalInr Decimal @map("total_inr") @db.Decimal(38, 18)
+
+  /// The USDT/INR display rate used to convert, recorded for audit. Null when
+  /// no display rate is configured - the hub refuses rather than inventing one.
+  usdtRateInr Decimal? @map("usdt_rate_inr") @db.Decimal(38, 18)
+
+  /// The USDT amount debited from the user and credited to the treasury. Null
+  /// for the same reason: no display rate, no USDT legs.
+  totalUsdt Decimal? @map("total_usdt") @db.Decimal(38, 18)
+
+  status EmberPurchaseStatus @default(COMPLETED)
+
+  /// Client-generated UUID for replay idempotency, per user.
+  clientRequestId String @map("client_request_id") @db.Uuid
+
+  /// Set only on the FAILED audit rows that record a refusal.
+  failedReason String? @map("failed_reason")
+
+  purchasedAt DateTime @default(now()) @map("purchased_at") @db.Timestamptz(3)
+  failedAt DateTime? @map("failed_at") @db.Timestamptz(3)
+
+  /// Idempotent replay: one purchase per caller request.
+  @@unique([userId, clientRequestId], map: "ember_purchases_user_client_request_key")
+  /// Per-user history, newest first.
+  @@index([userId, purchasedAt(sort: Desc)], map: "ember_purchases_user_purchased_at_idx")
+  /// Limit enforcement scans by user and window.
+  @@index([status, purchasedAt], map: "ember_purchases_status_purchased_at_idx")
+  @@map("ember_purchases")
+}
+
+// ---------------------------------------------------------------------------
+// EMBER staking simulation (Module 13+)
+// ---------------------------------------------------------------------------
+
+enum EmberStakeStatus {
+  ACTIVE
+  UNSTAKED
+}
+
+/// One simulated EMBER staking position.
+///
+/// The stake itself moves real wallet balances (WalletService lock on stake,
+/// unlock on unstake); the REWARDS this stake accrues are simulation-only and
+/// never stored to a wallet or minted - they are computed at read time from
+/// the configured APR and the elapsed time. staking and unstaking are the
+/// only real balance effects.
+model EmberStakePosition {
+  /// Surrogate key.
+  stakeId String @id @default(uuid()) @map("stake_id") @db.Uuid
+
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  /// EMBER locked into this position (actual wallet balance), at ledger precision.
+  amount Decimal @db.Decimal(38, 18)
+
+  status EmberStakeStatus @default(ACTIVE)
+
+  /// When the lock expires; unstakes before this are refused. Configurable
+  /// through EMBER_STAKING_LOCK_DAYS until the owner confirms.
+  lockUntil DateTime @map("lock_until") @db.Timestamptz(3)
+
+  clientRequestId String @map("client_request_id") @db.Uuid
+
+  stakedAt DateTime @default(now()) @map("staked_at") @db.Timestamptz(3)
+  unstakedAt DateTime? @map("unstaked_at") @db.Timestamptz(3)
+
+  /// Idempotent replay: one stake per caller request.
+  @@unique([userId, clientRequestId], map: "ember_stake_positions_user_client_request_key")
+  /// Per-user history, newest first.
+  @@index([userId, stakedAt(sort: Desc)], map: "ember_stake_positions_user_staked_at_idx")
+  @@map("ember_stake_positions")
+}
+
+// ---------------------------------------------------------------------------
+// RBAC, profiles & onboarding (cross-cutting)
+// ---------------------------------------------------------------------------
+
+/// One granted capability. A user accumulates rows rather than holding a
+/// single role value, so future roles and multi-role accounts need no schema
+/// change. USER is the baseline granted at first login; the privileged roles
+/// are granted only by an administrator or the CLI bootstrap.
+model UserRole {
+  /// Surrogate key.
+  id String @id @default(uuid()) @db.Uuid
+
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  role Role
+
+  /// Who granted this row. Null for the USER baseline and for CLI grants,
+  /// which have no authenticated actor.
+  grantedBy String? @map("granted_by") @db.Uuid
+
+  grantedAt DateTime @default(now()) @map("granted_at") @db.Timestamptz(3)
+
+  /// One row per (user, role): a re-grant is a no-op, not a duplicate.
+  @@unique([userId, role], map: "user_roles_user_id_role_key")
+  @@index([role], map: "user_roles_role_idx")
+  @@map("user_roles")
+}
+
+/// A user's request for a privileged role, decided by an administrator.
+/// There is deliberately no self-approve path.
+model RoleRequest {
+  /// Surrogate key.
+  id String @id @default(uuid()) @db.Uuid
+
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// The privileged role requested: EXPERT_TRADER or LIQUIDITY_PROVIDER.
+  /// PLATFORM_ADMIN and USER cannot be requested.
+  role Role
+
+  status RoleRequestStatus @default(PENDING)
+
+  /// Free-text note from the requester, optional.
+  note String?
+
+  decidedBy String? @map("decided_by") @db.Uuid
+  decidedByUser User? @relation("RoleRequestsDecided", fields: [decidedBy], references: [id], onDelete: SetNull)
+  decidedAt DateTime? @map("decided_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  /// At most one open request per (user, role): a duplicate submission is a
+  /// conflict, not a second queue entry.
+  @@unique([userId, role, status], map: "role_requests_user_role_status_key")
+  @@index([status, createdAt(sort: Desc)], map: "role_requests_status_created_at_idx")
+  @@map("role_requests")
+}
+
+/// A user's basic profile plus their financial-preference questionnaire,
+/// answered during onboarding and editable afterwards. One row per user.
+model UserProfile {
+  /// Surrogate key; the user is 1:1 via the unique below.
+  id String @id @default(uuid()) @db.Uuid
+
+  userId String @unique @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  displayName String? @map("display_name")
+  country String?
+
+  /// ISO 4217 code the user prefers for display (USD, INR, ...). Display only.
+  displayCurrency String? @map("display_currency")
+
+  experienceLevel String? @map("experience_level")
+
+  investmentCapitalRange String? @map("investment_capital_range")
+  capitalAvailability String? @map("capital_availability")
+
+  riskTolerance String? @map("risk_tolerance")
+  drawdownComfort String? @map("drawdown_comfort")
+  volatilityComfort String? @map("volatility_comfort")
+
+  primaryGoal String? @map("primary_goal")
+  timeHorizon String? @map("time_horizon")
+  expectedReturnRange String? @map("expected_return_range")
+  holdingPeriod String? @map("holding_period")
+
+  lossReaction String? @map("loss_reaction")
+  liquidityNeeds String? @map("liquidity_needs")
+  contributionFrequency String? @map("contribution_frequency")
+
+  /// Null until the user completes onboarding; once set it never returns to
+  /// null, so a completed onboarding never repeats.
+  onboardingCompletedAt DateTime? @map("onboarding_completed_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("user_profiles")
+}
+
+/// Append-only record of privileged administrative actions: who did what, to
+/// whom, when. Financial mutations keep their own ledger rows; this log is the
+/// authorization-and-intent trail beside them.
+model AdminAuditLog {
+  /// Surrogate key.
+  id String @id @default(uuid()) @db.Uuid
+
+  actorUserId String @map("actor_user_id") @db.Uuid
+  actor       User   @relation(fields: [actorUserId], references: [id], onDelete: Cascade)
+
+  /// Verb-style action name, e.g. `role.grant`, `role_request.approve`.
+  action String
+
+  /// The affected user, when the action targets one account.
+  targetUserId String? @map("target_user_id") @db.Uuid
+
+  /// Small structured detail (role name, previous/new state). Never secrets.
+  detail Json?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([createdAt(sort: Desc)], map: "admin_audit_logs_created_at_idx")
+  @@index([actorUserId, createdAt(sort: Desc)], map: "admin_audit_logs_actor_created_at_idx")
+  @@map("admin_audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// MODULE 14 - Sentinel: price monitoring and automated voice alerts
+//
+// Sentinel is an alerting system, not a trading system. Nothing in this block
+// places, modifies or cancels an order anywhere: an alert that reaches its
+// target can only produce a phone call describing what happened. Money and
+// portfolios are untouched; Sentinel reads market quotes through Module 06c's
+// LiveDataService and never through any other door.
+//
+// THREE TABLES. `sentinel_alerts` is the user's alert configuration and its
+// lifecycle. `sentinel_voice_settings` is the one voice/phone/consent record
+// per user (calls belong to people, not to alert configurations).
+// `sentinel_voice_calls` is one call job per triggered alert - the place
+// retries, provider references and outcomes are recorded attempts, never a
+// re-trigger.
+//
+// LIFECYCLE IS STATE-TRANSITION-GUARDED. A trigger is an `updateMany` whose
+// WHERE restates CURRENT status = ACTIVE, so two racing evaluate passes cannot
+// both claim the same alert, and the call job that follows the trigger is
+// created in the same transaction with a unique (alertId) index, so a repeated
+// poll can never enqueue a second call for one alert.
+// ---------------------------------------------------------------------------
+
+/// Lifecycle of one price alert.
+///
+/// ACTIVE -> TRIGGERED -> (CALL_QUEUED -> CALLING -> CALL_COMPLETED |
+/// CALL_FAILED) is the happy path. CANCELLED and EXPIRED are terminal for any
+/// further triggering: an alert cancelled or expired BEFORE its trigger never
+/// fires, and no path returns a triggered alert to ACTIVE (the observation
+/// that fired it is history, not configuration). TRIGGERED is also terminal on
+/// its own when voice was disabled or gated: an alert-only notification.
+enum SentinelAlertStatus {
+  /// Waiting on the market.
+  ACTIVE
+  /// Target met and the transition claimed; no call follows (voice off or gated).
+  TRIGGERED
+  /// A call job exists for this alert.
+  CALL_QUEUED
+  /// Dialled, waiting for the provider's outcome.
+  CALLING
+  /// Call answered and completed.
+  CALL_COMPLETED
+  /// Call never completed within the retry budget.
+  CALL_FAILED
+  /// Cancelled by the owner before triggering.
+  CANCELLED
+  /// Expiry elapsed without triggering.
+  EXPIRED
+}
+
+/// How an alert's target is compared against the observed price.
+enum SentinelTriggerCondition {
+  GREATER_THAN_OR_EQUAL
+  LESS_THAN_OR_EQUAL
+}
+
+/// Outcome classes of one voice call, as far as this module can know them.
+/// QUEUED exists while the job waits to dial; INITIATED is the answer of a
+/// provider that has accepted the call; the provider's own report fixes the
+/// rest. Covered reasons come straight from telephony reality - the enum
+/// refuses an outcome a provider never reported.
+enum SentinelCallStatus {
+  QUEUED
+  INITIATED
+  COMPLETED
+  BUSY
+  NO_ANSWER
+  REJECTED
+  CANCELED
+  FAILED
+}
+
+/// One stock/crypto price alert owned by exactly one user.
+model SentinelAlert {
+  /// Surrogate key.
+  alertId String @id @default(uuid()) @map("alert_id") @db.Uuid
+
+  ownerId String @map("owner_id") @db.Uuid
+  /// Restrict - alert history is user history; deleting a user must not
+  /// silently destroy it (the same posture as strategies).
+  owner User @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+
+  /// Canonical symbol from Module 06c's instrument catalogue, e.g. `AAPL`.
+  /// Validated against the catalogue at create/edit time; the catalogue is
+  /// what makes this a tradable instrument rather than an arbitrary string.
+  symbol String
+
+  /// Venue label from the catalogue (NASDAQ, crypto, ...). Display only.
+  exchange String @map("exchange")
+
+  /// Display name the user typed, shown verbatim in the UI and spoken in the
+  /// call. Kept independent of the catalogue name so a user can write the
+  /// name they think in.
+  displayName String @map("display_name")
+
+  /// Quote currency. Always USD for the shipped catalogue; stored so a future
+  /// multi-currency catalogue is data, not a schema change.
+  quoteCurrency String @map("quote_currency")
+
+  /// The user's threshold. NUMERIC(38,18), compared in Prisma.Decimal -
+  /// never a binary float.
+  targetPrice Decimal @map("target_price") @db.Decimal(38, 18)
+
+  condition SentinelTriggerCondition
+
+  status SentinelAlertStatus @default(ACTIVE)
+
+  /// Whether triggering this alert should attempt a voice call. False means
+  /// an alert-only notification: the row still transitions and history keeps
+  /// it, but no call job is created.
+  voiceEnabled Boolean @default(true) @map("voice_enabled")
+
+  /// The last honest observation the monitor made, whatever it was. Null
+  /// fields mean "never observed" - never "assumed zero". `observedMarketState`
+  /// and `observedStale` let the UI say "stale quote" or "market closed"
+  /// rather than implying a live price.
+  observedPrice Decimal? @map("observed_price") @db.Decimal(38, 18)
+  observedAsOf DateTime? @map("observed_as_of") @db.Timestamptz(3)
+  observedProvider String? @map("observed_provider")
+  observedMarketState String? @map("observed_market_state")
+  observedStale Boolean? @map("observed_stale")
+  lastEvaluatedAt DateTime? @map("last_evaluated_at") @db.Timestamptz(3)
+
+  /// When this alert stops being evaluated. Null = never expires.
+  expiresAt DateTime? @map("expires_at") @db.Timestamptz(3)
+
+  /// Why a trigger that wanted to call did not queue a call. Null when no
+  /// trigger has been gated (or voice was simply off).
+  callSkipReason String? @map("call_skip_reason")
+
+  triggeredAt DateTime? @map("triggered_at") @db.Timestamptz(3)
+  cancelledAt DateTime? @map("cancelled_at") @db.Timestamptz(3)
+  /// Machine-readable, user-safe reason for a cancellation.
+  cancelReason String? @map("cancel_reason")
+  expiredAt DateTime? @map("expired_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  calls SentinelVoiceCall[]
+
+  /// "My alerts", newest first.
+  @@index([ownerId, createdAt(sort: Desc)], map: "sentinel_alerts_owner_created_at_idx")
+  /// The monitor's scan: active, unexpired alerts.
+  @@index([status, expiresAt], map: "sentinel_alerts_status_expires_at_idx")
+  /// One call job per alert (the call row carries it).
+  @@index([ownerId, status], map: "sentinel_alerts_owner_status_idx")
+  @@map("sentinel_alerts")
+}
+
+/// One user's voice-call settings: number, verification, consent and contact
+/// window. One row per user (calls are made to a person, not to an alert),
+/// created lazily at first use.
+model SentinelVoiceSetting {
+  /// The user these settings belong to; the primary key doubles as the 1:1.
+  /// Cascade: nothing else in Sentinel is audit-critical, and a deleted user's
+  /// phone number must not outlive them.
+  userId String @id @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// E.164 with a leading +, e.g. `+14155552671`. The only stored phone
+  /// format, so the caller (and any future provider) never re-parses. Present
+  /// but unverified until confirmed by code.
+  phoneE164 String? @map("phone_e164")
+
+  /// When the phone was confirmed. Every consent requirement keys on this.
+  phoneVerifiedAt DateTime? @map("phone_verified_at") @db.Timestamptz(3)
+
+  /// SHA-256 hex of the 6-digit verification code. The code itself is NEVER
+  /// stored; the verification window and attempt budget live beside it.
+  verificationCodeHash String? @map("verification_code_hash")
+  verificationExpiresAt DateTime? @map("verification_expires_at") @db.Timestamptz(3)
+  verificationAttempts Int @default(0) @map("verification_attempts")
+
+  /// Explicit consent to automated voice calls, and when it was withdrawn.
+  consentAt DateTime? @map("consent_at") @db.Timestamptz(3)
+  consentWithdrawnAt DateTime? @map("consent_withdrawn_at") @db.Timestamptz(3)
+
+  /// The user-level off switch: disabling voice stops FEATURE-NEW calls
+  /// without deleting any alert or history.
+  voiceDisabledAt DateTime? @map("voice_disabled_at") @db.Timestamptz(3)
+
+  /// Quiet hours in minutes-since-UTC-midnight (e.g. 1320 = 22:00 UTC). Null
+  /// = no quiet window. Storage is UTC only; the client renders local.
+  quietHoursStartUtc Int? @map("quiet_hours_start_utc")
+  quietHoursEndUtc   Int? @map("quiet_hours_end_utc")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("sentinel_voice_settings")
+}
+
+/// One voice-call job: at most one per alert (retains retries and outcomes).
+///
+/// WHY THE UNIQUE(alertId): the trigger transaction creates this row in the
+/// same transaction that claims the alert from ACTIVE, so a repeated poll that
+/// loses the trigger race cannot exist, and a repeated trigger that somehow
+/// ran twice would collide here rather than dial twice.
+model SentinelVoiceCall {
+  /// Surrogate key.
+  callId String @id @default(uuid()) @map("call_id") @db.Uuid
+
+  alertId String @map("alert_id") @db.Uuid
+  /// Cascade - a call belongs to one alert; that alert's history is the only
+  /// thing referencing it (Module 05-style deletes do not exist here, and the
+  /// owner relation already RESTRICTs).
+  alert SentinelAlert @relation(fields: [alertId], references: [alertId], onDelete: Cascade)
+
+  status SentinelCallStatus @default(QUEUED)
+
+  /// Attempts already made. Never a number the caller supplies.
+  attempts Int @default(0)
+  /// Retry budget, captured from configuration at queue time so later config
+  /// changes cannot silently widen an old job's spend.
+  maxAttempts Int @map("max_attempts")
+
+  /// Voice provider mode the job was queued under.
+  provider String
+
+  /// The provider's own call reference, once dialled. Unique: two rows were
+  /// never the same call.
+  providerCallId String? @unique @map("provider_call_id")
+
+  /// The exact spoken text sent to the provider, so a disputed call can be
+  /// replayed word for word. Contains no user identifiers or balances.
+  spokenText String? @map("spoken_text")
+
+  queuedAt DateTime @default(now()) @map("queued_at") @db.Timestamptz(3)
+  initiatedAt DateTime? @map("initiated_at") @db.Timestamptz(3)
+  completedAt DateTime? @map("completed_at") @db.Timestamptz(3)
+
+  /// When the caller pass may next dial, for retry backoff.
+  nextAttemptAt DateTime? @map("next_attempt_at") @db.Timestamptz(3)
+
+  /// Sanitised failure class (e.g. PROVIDER_ERROR, RETRIES_EXHAUSTED). Never a
+  /// raw carrier message; provider internals stay out of the client surface.
+  failReason String? @map("fail_reason")
+
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// The caller pass's scan: waiting work, in queue order.
+  @@index([status, queuedAt], map: "sentinel_voice_calls_status_queued_at_idx")
+  /// Retry scheduling.
+  @@index([status, nextAttemptAt], map: "sentinel_voice_calls_status_next_attempt_at_idx")
+  /// History per alert, newest first.
+  @@index([alertId], map: "sentinel_voice_calls_alert_id_idx")
+  /// THE IDEMPOTENCY KEY: one call job per alert, ever.
+  @@unique([alertId], map: "sentinel_voice_calls_alert_id_key")
+  @@map("sentinel_voice_calls")
+}

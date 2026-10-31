@@ -1,0 +1,24 @@
+{
+  "network": "sepolia",
+  "chainId": 11155111,
+  "tokenAddress": "0x4A90080e30F107BE32Ee332Bc2cE92058e12Bc82",
+  "deployer": "0x2c35a0467D907C091cf5c6c6ceBF19320fF7661E",
+  "admin": "0x2c35a0467D907C091cf5c6c6ceBF19320fF7661E",
+  "treasuryAddress": "0x7Fb75d286974243c9f45f38Ae7292EBFFd4FCA8B",
+  "minterAddress": "0xdEFe002d9A0fBb6A880FB00836a3EA940333Da06",
+  "burnerAddress": "0x7Fb75d286974243c9f45f38Ae7292EBFFd4FCA8B",
+  "maxSupplyWhole": "100000000",
+  "initialTreasuryAllocationWhole": "10000000",
+  "mintedAt": "2026-10-22T16:29:36.032Z",
+  "txHash": "0xec9fa8890ad7079787576acce92aba05c41853928693a6865b085868740a63aa",
+  "blockNumber": 11970734,
+  "backendEnv": {
+    "BLOCKCHAIN_ENABLED": "true",
+    "BLOCKCHAIN_NETWORK": "sepolia",
+    "BLOCKCHAIN_CHAIN_ID": "11155111",
+    "BLOCKCHAIN_RPC_URL": "<set to your testnet RPC endpoint>",
+    "BLOCKCHAIN_TOKEN_ADDRESS": "0x4A90080e30F107BE32Ee332Bc2cE92058e12Bc82",
+    "BLOCKCHAIN_TREASURY_ADDRESS": "0x7Fb75d286974243c9f45f38Ae7292EBFFd4FCA8B",
+    "EMBER_MINT_MAX_SUPPLY": "100000000"
+  }
+}

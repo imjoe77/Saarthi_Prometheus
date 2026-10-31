@@ -1,0 +1,194 @@
+PROMETHEUS — UI PROJECT CONTEXT
+
+Prometheus is a modern digital-asset platform prototype designed to bring wallet management, USDT exchange, intelligent copy trading, portfolio tracking, AI assistance, and a native token ecosystem into one unified application.
+
+The target user is someone interested in digital assets who may not be an experienced trader. The product should therefore feel professional and sophisticated while remaining easy to understand.
+
+CORE FEATURES
+-------------
+1. Dashboard
+2. Intelligent Copy Trading
+3. USDT Exchange
+4. Portfolio Management
+5. AI Trading Buddy
+6. EMBER & Tokenomics
+7. Wallet & Activity
+
+COPY TRADING
+------------
+Users can follow experienced traders/strategies and allocate capital to them.
+
+Prometheus is designed to go beyond simple blind copy trading. Its adaptive copy engine can determine whether to:
+- Copy
+- Reduce
+- Delay
+- Skip
+
+based on factors such as user capital, allocation, risk limits, market conditions, slippage and portfolio exposure.
+
+The UI should make these decisions understandable to normal users.
+
+TRADING BUDDY
+------------
+Trading Buddy is Prometheus's built-in AI assistant.
+
+It acts as a personal trading analyst and explains things such as:
+- Why a trade was copied or skipped
+- Why a position size was changed
+- How a strategy is performing
+- Portfolio and risk information
+- Prometheus features and tokenomics
+
+It should feel deeply integrated into the product, NOT like a generic chatbot.
+
+USDT EXCHANGE
+-------------
+Prometheus includes a prototype USDT exchange with zero explicit brokerage.
+
+The UI should show:
+- INR ↔ USDT conversion
+- Prometheus price
+- Reference price
+- Customer savings
+- Slippage
+- Liquidity
+- Order summary
+
+Example:
+10,000 USDT at ₹100 = ₹10,00,000.
+
+If the reference price is ₹108, the UI can show ₹80,000 in customer savings.
+
+This is a reference-price savings calculation / foregone potential revenue, not an actual cash loss.
+
+EMBER
+-----
+EMBER is the native platform token of Prometheus.
+
+The EMBER ecosystem includes concepts such as:
+- Token utility
+- Locking
+- Platform benefits
+- Buyback
+- Burn
+- Supply tracking
+- Treasury
+
+The EMBER & Tokenomics page should make token activity transparent and easy to understand.
+
+Example tokenomics configuration:
+60% → Burn allocation
+40% → Buyback allocation
+
+This is an illustrative prototype configuration, not a guaranteed economic model.
+
+The UI should show concepts such as:
+- Total Supply
+- Circulating Supply
+- Locked Supply
+- Burned Supply
+- Buyback Activity
+- Treasury Health
+- Burn Progress
+
+VISUAL DIRECTION
+----------------
+The approved Prometheus visual style is a premium dark trading-terminal aesthetic.
+
+Primary colors:
+- Orange: #FF5A1F
+- Near black: #111111
+- Dark surfaces: #1A1A1A / #242424
+- White/light text
+
+Typography should feel similar to Inter, Geist or SF Pro.
+
+The design should be:
+- Professional
+- Minimal
+- Modern
+- High-contrast
+- Structured
+- Premium
+- Financial-product oriented
+
+Avoid:
+- Excessive gradients
+- Neon crypto aesthetics
+- Excessive glassmorphism
+- Generic AI startup styling
+- Gaming-style interfaces
+- Excessive animations
+- Overuse of orange
+
+Orange should be used strategically for primary actions, active states and important highlights.
+
+UI/UX PRINCIPLE
+---------------
+The biggest priority is CLARITY.
+
+Do not overcrowd screens with too many cards, metrics or charts.
+
+Show the most important information first and move advanced information into:
+- Tabs
+- Expandable sections
+- Drawers
+- Modals
+- Detail pages
+
+The dashboard should be a summary, not the entire application.
+
+Every page should have a clear purpose:
+
+Dashboard:
+"How is my account doing?"
+
+Copy Trading:
+"What am I copying and how is it performing?"
+
+USDT Exchange:
+"How much USDT am I buying/selling and at what price?"
+
+Portfolio:
+"What do I own and how is it performing?"
+
+Trading Buddy:
+"Why is Prometheus doing this?"
+
+EMBER & Tokenomics:
+"What is EMBER and what is happening to its supply?"
+
+The application should feel like one connected ecosystem rather than a collection of unrelated pages.
+
+INITIAL UI PAGES
+----------------
+The first UI version should focus on:
+
+1. Dashboard
+2. Copy Trading
+3. USDT Exchange
+4. Portfolio
+5. Trading Buddy
+6. EMBER & Tokenomics
+
+The Dashboard should establish the main visual language and the remaining pages should feel consistent with it.
+
+IMPORTANT
+---------
+This phase is ONLY about designing and implementing the frontend UI.
+
+Do not over-engineer backend functionality yet.
+Use realistic mock/demo data where necessary.
+
+Prioritize:
+- Visual quality
+- Layout
+- Navigation
+- Reusable components
+- Responsive design
+- Clear information hierarchy
+- Consistency across all screens
+
+The overall feeling should be:
+
+"An intelligent digital-asset command center that is powerful enough for traders but simple enough for beginners."

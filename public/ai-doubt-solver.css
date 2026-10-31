@@ -1,0 +1,1174 @@
+/* ==========================================================================
+   PROMETHEUS — PYRUS, THE PAGE GUIDE
+   A creature who lives on the page: he materialises, thinks out loud in the
+   cloud above his head, walks over to what he is talking about and points at
+   it with a laser beam. There is no chat window anywhere in here.
+   ========================================================================== */
+
+:root {
+  --ai-primary: #ff6a1a;
+  --ai-primary-hover: #ff7d36;
+  --ai-primary-glow: rgba(255, 106, 26, 0.38);
+  --ai-primary-soft: rgba(255, 106, 26, 0.12);
+  --ai-accent: #6f8cff;
+  --ai-accent-glow: rgba(111, 140, 255, 0.32);
+  --ai-success: #22d3a0;
+  --ai-bg-glass: rgba(15, 12, 18, 0.86);
+  --ai-bg-card: rgba(24, 18, 27, 0.78);
+  --ai-border: rgba(255, 106, 26, 0.24);
+  --ai-border-subtle: rgba(255, 255, 255, 0.08);
+  --ai-text-main: #f5ede5;
+  --ai-text-muted: #b9a28f;
+  --ai-text-dim: #7f6e61;
+  --ai-font: Manrope, system-ui, -apple-system, sans-serif;
+  --ai-font-mono: 'JetBrains Mono', monospace;
+  --ai-radius-lg: 20px;
+  --ai-radius-md: 14px;
+  --ai-radius-sm: 8px;
+  --ai-shadow-panel: 0 24px 60px -12px rgba(0, 0, 0, 0.65), 0 0 0 1px var(--ai-border);
+  --ai-shadow-popup: 0 20px 50px -10px rgba(0, 0, 0, 0.7), 0 0 35px rgba(255, 106, 26, 0.18);
+  --ai-ease-spring: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+:root[data-theme="light"] {
+  --ai-bg-glass: rgba(255, 255, 255, 0.92);
+  --ai-bg-card: rgba(246, 248, 252, 0.95);
+  --ai-border: rgba(255, 106, 26, 0.28);
+  --ai-border-subtle: rgba(22, 26, 45, 0.09);
+  --ai-text-main: #151a2d;
+  --ai-text-muted: #5e687f;
+  --ai-text-dim: #8993a9;
+  --ai-shadow-panel: 0 24px 60px -12px rgba(21, 26, 45, 0.22), 0 0 0 1px var(--ai-border);
+  --ai-shadow-popup: 0 20px 50px -10px rgba(21, 26, 45, 0.25), 0 0 35px rgba(255, 106, 26, 0.15);
+}
+
+/* ==========================================================================
+   1. THE SUMMON BUTTON
+   The only piece of conventional UI Pyrus has: the latch that calls him onto
+   the page, and which sends him away again.
+   ========================================================================== */
+
+.ai-fab-container {
+  position: fixed;
+  right: 28px;
+  bottom: 28px;
+  z-index: 9980;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-family: var(--ai-font);
+}
+.ai-fab-container.character-visible { z-index: 9987; }
+
+.ai-fab-btn {
+  position: relative;
+  width: 60px;
+  height: 60px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 140, 50, 0.45);
+  background: radial-gradient(circle at 30% 30%, #ff8b32 0%, #f05a0b 60%, #b83a00 100%);
+  color: #fff;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  box-shadow: 0 10px 28px var(--ai-primary-glow), 0 0 0 1px rgba(255, 255, 255, 0.2) inset;
+  transition: transform 0.28s var(--ai-ease-spring), box-shadow 0.28s var(--ai-ease-spring), border-color 0.28s;
+  animation: aiFabFloat 3.8s ease-in-out infinite;
+  outline: none;
+}
+
+.ai-fab-btn:hover {
+  transform: translateY(-4px) scale(1.06);
+  box-shadow: 0 16px 36px rgba(255, 106, 26, 0.55), 0 0 24px rgba(255, 106, 26, 0.45);
+  border-color: rgba(255, 200, 150, 0.8);
+}
+
+.ai-fab-btn:active {
+  transform: translateY(-1px) scale(0.98);
+}
+
+.ai-fab-btn:focus-visible {
+  outline: 3px solid #ff9d54;
+  outline-offset: 4px;
+}
+
+.ai-fab-icon {
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  transition: transform 0.3s var(--ai-ease-spring);
+}
+
+/* Pyrus's portrait, filling the round latch. */
+.ai-fab-icon img {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  object-fit: cover;
+  object-position: top center;
+  filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.3));
+}
+
+.ai-fab-btn:hover .ai-fab-icon {
+  transform: rotate(8deg) scale(1.08);
+}
+
+.ai-fab-pulse-ring {
+  position: absolute;
+  inset: -6px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 106, 26, 0.4);
+  pointer-events: none;
+  animation: aiFabPulseRing 3.2s cubic-bezier(0.24, 0, 0.38, 1) infinite;
+}
+
+.ai-fab-badge {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--ai-success);
+  border: 2px solid #140d08;
+  box-shadow: 0 0 8px rgba(34, 211, 160, 0.8);
+  animation: aiDotGlow 2s ease-in-out infinite alternate;
+}
+
+/* Tooltip on hover */
+.ai-fab-tooltip {
+  position: absolute;
+  right: calc(100% + 14px);
+  top: 50%;
+  transform: translateY(-50%) translateX(6px);
+  background: var(--ai-bg-glass);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  color: var(--ai-text-main);
+  border: 1px solid var(--ai-border);
+  padding: 8px 14px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  transition: opacity 0.2s var(--ai-ease-spring), transform 0.2s var(--ai-ease-spring);
+}
+
+.ai-fab-btn:hover + .ai-fab-tooltip,
+.ai-fab-tooltip.show {
+  opacity: 1;
+  transform: translateY(-50%) translateX(0);
+}
+
+/* Keyframes */
+@keyframes aiFabFloat {
+  0%, 100% { transform: translateY(0px); }
+  50% { transform: translateY(-6px); }
+}
+
+@keyframes aiFabPulseRing {
+  0% { transform: scale(0.95); opacity: 0.8; }
+  60%, 100% { transform: scale(1.35); opacity: 0; }
+}
+
+@keyframes aiDotGlow {
+  0% { transform: scale(1); opacity: 0.85; }
+  100% { transform: scale(1.2); opacity: 1; box-shadow: 0 0 12px var(--ai-success); }
+}
+
+/* ==========================================================================
+   2. PYRUS HIMSELF
+   One stage holds the speech cloud and, standing below it, the creature.
+   He materialises out of a blur instead of sliding in like a panel.
+   ========================================================================== */
+
+.ai-pyrus-scene {
+  position: fixed;
+  right: 26px;
+  bottom: 92px;
+  z-index: 9987;
+  width: 380px;
+  height: 580px;
+  font-family: var(--ai-font);
+  color: var(--ai-text-main);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  filter: blur(10px) saturate(0.6);
+  transform: translateY(26px) scale(0.94);
+  transform-origin: 70% 100%;
+  transition: opacity 0.5s var(--ai-ease-spring),
+              transform 0.62s var(--ai-ease-spring),
+              filter 0.5s ease,
+              visibility 0.5s,
+              left 0.55s cubic-bezier(0.2, 0.8, 0.2, 1),
+              top 0.55s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.ai-pyrus-scene.summoned {
+  opacity: 1;
+  visibility: visible;
+  filter: none;
+  transform: translateY(0) scale(1);
+}
+
+/* The surface the user actually talks to. Everything else is scenery. */
+.ai-pyrus-speech,
+.ai-pyrus-nameplate { pointer-events: auto; }
+
+/* --- ambient light behind him ------------------------------------------- */
+.ai-pyrus-halo {
+  position: absolute;
+  right: -8px;
+  bottom: -18px;
+  width: 330px;
+  height: 330px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 52% 64%, rgba(255, 138, 48, 0.42), rgba(255, 106, 26, 0.16) 42%, transparent 70%);
+  filter: blur(12px);
+  pointer-events: none;
+  animation: aiPyrusHalo 6.4s ease-in-out infinite;
+}
+
+@keyframes aiPyrusHalo {
+  0%, 100% { transform: scale(1); opacity: 0.8; }
+  50% { transform: scale(1.08); opacity: 1; }
+}
+
+/* --- embers drifting off him, so the screen never looks frozen ---------- */
+.ai-pyrus-motes {
+  position: absolute;
+  right: 0;
+  bottom: 44px;
+  width: 300px;
+  height: 340px;
+  pointer-events: none;
+}
+
+.ai-pyrus-motes span {
+  position: absolute;
+  bottom: 0;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: rgba(255, 194, 136, 0.95);
+  box-shadow: 0 0 10px rgba(255, 140, 60, 0.9);
+  opacity: 0;
+  animation: aiPyrusMote 7s linear infinite;
+}
+
+.ai-pyrus-motes span:nth-child(1) { left: 8%; animation-delay: 0s; }
+.ai-pyrus-motes span:nth-child(2) { left: 26%; width: 3px; height: 3px; animation-delay: 1.4s; animation-duration: 8.4s; }
+.ai-pyrus-motes span:nth-child(3) { left: 43%; width: 4px; height: 4px; animation-delay: 2.9s; animation-duration: 6.2s; }
+.ai-pyrus-motes span:nth-child(4) { left: 61%; animation-delay: 0.8s; animation-duration: 7.6s; }
+.ai-pyrus-motes span:nth-child(5) { left: 78%; width: 3px; height: 3px; animation-delay: 3.8s; animation-duration: 8.8s; }
+.ai-pyrus-motes span:nth-child(6) { left: 92%; width: 4px; height: 4px; animation-delay: 5.2s; animation-duration: 6.8s; }
+
+@keyframes aiPyrusMote {
+  0% { transform: translateY(10px) scale(0.4); opacity: 0; }
+  12% { opacity: 0.9; }
+  70% { opacity: 0.45; }
+  100% { transform: translateY(-300px) scale(1.1); opacity: 0; }
+}
+
+/* --- the creature ------------------------------------------------------- */
+.ai-pyrus-body {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 232px;
+  height: 280px;
+  transform-origin: 58% 94%;
+  pointer-events: none;
+  /* Pyrus has no drawn eyes, so the looking is done with his body: he turns and
+     leans toward whatever he is attending to. Both come from the gaze variables
+     the script writes, plus whatever the current mood adds on top. */
+  transform: translate3d(calc(var(--ai-gaze-x, 0) * 9px),
+                         calc(var(--ai-gaze-y, 0) * 7px + var(--ai-mood-lift, 0px)),
+                         0)
+             rotate(calc(var(--ai-gaze-x, 0) * 4deg + var(--ai-mood-tilt, 0deg)));
+  transition: transform 0.55s cubic-bezier(0.22, 0.8, 0.25, 1);
+  /* keeps the gaze light's blending inside his own artwork */
+  isolation: isolate;
+}
+
+.ai-pyrus-image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  object-position: bottom center;
+  transform-origin: 50% 100%;
+  /* the orange rim is the page's own light wrapping around him */
+  filter: drop-shadow(0 26px 34px rgba(0, 0, 0, 0.5)) drop-shadow(0 0 22px rgba(255, 106, 26, 0.32));
+  animation: aiPyrusBreathe 4.6s ease-in-out infinite;
+}
+
+/* --- his gaze ----------------------------------------------------------- */
+/* A warm light that travels through him toward whatever he is looking at. The
+   sprite itself masks it (the mask image is set by the script, where the avatar
+   path is known), so the light can only ever appear *inside* his silhouette —
+   it can never spill onto the page or land in the wrong place on any artwork. */
+.ai-pyrus-gaze {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  mix-blend-mode: screen;
+  background-image: radial-gradient(circle at 50% 50%,
+                    var(--ai-gaze-light, rgba(255, 210, 156, 0.92)) 0%,
+                    var(--ai-gaze-warm, rgba(255, 146, 54, 0.46)) 38%,
+                    rgba(255, 106, 26, 0) 70%);
+  background-repeat: no-repeat;
+  background-size: 64% 48%;
+  background-position: calc(50% + var(--ai-gaze-x, 0) * 64%) calc(40% + var(--ai-gaze-y, 0) * 58%);
+  -webkit-mask-size: contain;
+  -webkit-mask-position: bottom center;
+  -webkit-mask-repeat: no-repeat;
+  mask-size: contain;
+  mask-position: bottom center;
+  mask-repeat: no-repeat;
+  filter: blur(2px);
+  transition: background-position 0.55s cubic-bezier(0.22, 0.8, 0.25, 1),
+              opacity 0.55s ease;
+}
+
+.ai-pyrus-shadow {
+  position: absolute;
+  left: 50%;
+  bottom: 2px;
+  width: 190px;
+  height: 26px;
+  transform: translateX(-50%);
+  border-radius: 50%;
+  background: radial-gradient(ellipse at center, rgba(0, 0, 0, 0.55), rgba(0, 0, 0, 0.18) 55%, transparent 72%);
+  animation: aiPyrusShadow 4.6s ease-in-out infinite;
+}
+
+@keyframes aiPyrusBreathe {
+  0%, 100% { transform: translateY(0) scale(1) rotate(0deg); }
+  50% { transform: translateY(-9px) scale(1.014) rotate(-0.6deg); }
+}
+
+@keyframes aiPyrusShadow {
+  0%, 100% { transform: translateX(-50%) scale(1); opacity: 0.9; }
+  50% { transform: translateX(-50%) scale(0.93); opacity: 0.6; }
+}
+
+/* --- his moods ---------------------------------------------------------- */
+.ai-pyrus-scene[data-mood="greeting"] .ai-pyrus-image { animation: aiPyrusGreet 1.05s var(--ai-ease-spring) 2; }
+.ai-pyrus-scene[data-mood="speaking"] .ai-pyrus-image { animation: aiPyrusSpeak 0.44s ease-in-out infinite alternate; }
+.ai-pyrus-scene[data-mood="thinking"] .ai-pyrus-image { animation: aiPyrusThink 2.6s ease-in-out infinite; }
+.ai-pyrus-scene[data-mood="listening"] .ai-pyrus-image { animation: aiPyrusListen 1.8s ease-in-out infinite; }
+
+@keyframes aiPyrusGreet {
+  0%, 100% { transform: rotate(0deg) translateY(0); }
+  20% { transform: rotate(-7deg) translateY(-12px); }
+  45% { transform: rotate(5deg) translateY(-4px); }
+  70% { transform: rotate(-4deg) translateY(-9px); }
+}
+
+/* talking: the whole body nods, which reads as speech on a flat sprite */
+@keyframes aiPyrusSpeak {
+  from { transform: translateY(0) scale(1, 1) rotate(0deg); }
+  to { transform: translateY(-3px) scale(1.006, 0.982) rotate(-1.4deg); }
+}
+
+@keyframes aiPyrusThink {
+  0%, 100% { transform: rotate(-2.4deg) translateY(0); }
+  50% { transform: rotate(2.4deg) translateY(-5px); }
+}
+
+@keyframes aiPyrusListen {
+  0%, 100% { transform: scale(1) translateY(0); }
+  50% { transform: scale(1.022) translateY(-4px); }
+}
+
+/* --- his expressions ----------------------------------------------------- */
+/* Colour is the face he has. The light inside him burns gold when he greets,
+   settles to warm orange while he talks, and goes cool and pale while he is
+   thinking. The rest of the expression is posture, carried by the same
+   transform his gaze uses so the two can never fight over it. */
+.ai-pyrus-scene[data-mood="idle"]      { --ai-gaze-light: rgba(255, 206, 150, 0.90); --ai-gaze-warm: rgba(255, 140, 50, 0.42); }
+.ai-pyrus-scene[data-mood="greeting"]  { --ai-gaze-light: rgba(255, 238, 182, 0.98); --ai-gaze-warm: rgba(255, 172, 72, 0.60); }
+.ai-pyrus-scene[data-mood="speaking"]  { --ai-gaze-light: rgba(255, 224, 172, 0.96); --ai-gaze-warm: rgba(255, 152, 56, 0.56); }
+.ai-pyrus-scene[data-mood="listening"] { --ai-gaze-light: rgba(255, 212, 160, 0.92); --ai-gaze-warm: rgba(255, 148, 54, 0.48); }
+.ai-pyrus-scene[data-mood="thinking"]  { --ai-gaze-light: rgba(200, 218, 255, 0.90); --ai-gaze-warm: rgba(111, 140, 255, 0.42); }
+
+.ai-pyrus-scene[data-mood="idle"] .ai-pyrus-gaze      { opacity: 0.52; }
+.ai-pyrus-scene[data-mood="greeting"] .ai-pyrus-gaze  { opacity: 0.95; animation: aiGazeFlare 0.85s ease-out 3; }
+.ai-pyrus-scene[data-mood="speaking"] .ai-pyrus-gaze  { opacity: 0.92; animation: aiGazeSpeak 1.05s ease-in-out infinite alternate; }
+.ai-pyrus-scene[data-mood="listening"] .ai-pyrus-gaze { opacity: 0.72; animation: aiGazeListen 2.4s ease-in-out infinite; }
+.ai-pyrus-scene[data-mood="thinking"] .ai-pyrus-gaze  { opacity: 0.60; animation: aiGazeThink 3.1s ease-in-out infinite; }
+
+/* he leans back and up while he thinks, and settles forward when he listens */
+.ai-pyrus-scene[data-mood="thinking"] .ai-pyrus-body  { --ai-mood-lift: -5px; --ai-mood-tilt: -1.8deg; }
+.ai-pyrus-scene[data-mood="listening"] .ai-pyrus-body { --ai-mood-tilt: 1.4deg; }
+.ai-pyrus-scene[data-mood="speaking"] .ai-pyrus-body  { --ai-mood-lift: -2px; }
+
+/* While he is answering about something on the page his light stops wandering
+   and stays on it — that fixed gaze is him pointing with his attention, and it
+   runs alongside the laser beam the highlight manager draws. */
+.ai-pyrus-scene[data-focus="target"] { --ai-gaze-light: rgba(255, 244, 208, 1); }
+.ai-pyrus-scene[data-focus="target"] .ai-pyrus-gaze { opacity: 1; animation: none; }
+.ai-pyrus-scene[data-focus="target"] .ai-pyrus-body { --ai-mood-lift: -3px; }
+
+@keyframes aiGazeFlare {
+  0% { opacity: 0.5; transform: scale(0.94); }
+  55% { opacity: 1; transform: scale(1.05); }
+  100% { opacity: 1; transform: scale(1); }
+}
+
+@keyframes aiGazeSpeak {
+  from { opacity: 0.76; }
+  to { opacity: 1; }
+}
+
+@keyframes aiGazeListen {
+  0%, 100% { opacity: 0.66; }
+  50% { opacity: 0.86; }
+}
+
+@keyframes aiGazeThink {
+  0%, 100% { opacity: 0.46; transform: translateY(0) scale(1); }
+  50% { opacity: 0.74; transform: translateY(-5px) scale(1.03); }
+}
+
+/* --- the speech cloud --------------------------------------------------- */
+.ai-pyrus-speech {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 302px;
+  max-height: 312px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 15px 16px 14px;
+  border-radius: 22px 22px 22px 8px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0) 45%), var(--ai-bg-glass);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid var(--ai-border);
+  box-shadow: var(--ai-shadow-panel);
+  pointer-events: auto;
+}
+
+/* The tail always points down at his head. */
+.ai-pyrus-speech::after {
+  content: '';
+  position: absolute;
+  right: 34px;
+  bottom: -9px;
+  width: 16px;
+  height: 16px;
+  background: var(--ai-bg-glass);
+  border-right: 1px solid var(--ai-border);
+  border-bottom: 1px solid var(--ai-border);
+  transform: rotate(45deg);
+}
+
+/* What the user last said, so the answer never floats out of context. */
+.ai-speech-echo {
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  line-height: 1.4;
+  color: var(--ai-primary);
+  border-left: 2px solid var(--ai-primary);
+  padding-left: 9px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.ai-speech-echo::before { content: 'You asked · '; color: var(--ai-text-dim); }
+.ai-speech-echo[hidden] { display: none; }
+
+.ai-speech-body {
+  font-size: 14px;
+  line-height: 1.55;
+  max-height: 116px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.ai-speech-text { white-space: pre-wrap; }
+
+.ai-speech-dots {
+  display: inline-flex;
+  gap: 4px;
+  margin-right: 7px;
+  vertical-align: middle;
+}
+
+.ai-speech-dots[hidden] { display: none; }
+
+.ai-speech-dots i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--ai-primary);
+  animation: aiSpeechDot 1.1s ease-in-out infinite;
+}
+
+.ai-speech-dots i:nth-child(2) { animation-delay: 0.16s; }
+.ai-speech-dots i:nth-child(3) { animation-delay: 0.32s; }
+
+@keyframes aiSpeechDot {
+  0%, 80%, 100% { transform: scale(0.55); opacity: 0.35; }
+  40% { transform: scale(1.15); opacity: 1; }
+}
+
+/* Follow-ups he offers, drawn from the answer he just gave. */
+.ai-speech-replies {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* While Pyrus is thinking or speaking, hide the replies entirely so the answer
+   is the only thing on screen. */
+.ai-pyrus-speech.typing .ai-speech-replies-header,
+.ai-pyrus-speech.typing .ai-speech-replies,
+.ai-speech-replies:empty {
+  display: none !important;
+}
+
+/* Minimize/Maximize toggle for suggestions */
+.ai-speech-replies-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 8px;
+  padding: 0 4px;
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ai-text-dim);
+  border-top: 1px solid var(--ai-border-subtle);
+  padding-top: 8px;
+}
+
+.ai-speech-replies-header[hidden] {
+  display: none;
+}
+
+.ai-replies-toggle {
+  background: transparent;
+  border: none;
+  padding: 2px;
+  cursor: pointer;
+  color: var(--ai-text-dim);
+  display: flex;
+  align-items: center;
+  transition: transform 0.25s var(--ai-ease-spring), color 0.2s;
+}
+
+.ai-replies-toggle:hover {
+  color: var(--ai-primary);
+}
+
+.ai-replies-toggle svg {
+  width: 16px;
+  height: 16px;
+  fill: currentColor;
+}
+
+.ai-pyrus-speech.replies-minimized .ai-replies-toggle {
+  transform: rotate(-90deg);
+}
+
+.ai-pyrus-speech.replies-minimized .ai-speech-replies {
+  display: none !important;
+}
+
+.ai-reply-btn {
+  border: 1px solid var(--ai-border-subtle);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--ai-text-main);
+  padding: 6px 11px;
+  border-radius: 999px;
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1.3;
+  text-align: left;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: all 0.2s var(--ai-ease-spring);
+}
+
+.ai-reply-btn::before {
+  content: '✦';
+  font-size: 10px;
+  color: var(--ai-primary);
+}
+
+.ai-reply-btn:hover {
+  border-color: var(--ai-primary);
+  background: var(--ai-primary-soft);
+  color: var(--ai-primary);
+  transform: translateY(-2px);
+}
+
+.ai-reply-btn:focus-visible {
+  outline: 2px solid var(--ai-primary);
+  outline-offset: 2px;
+}
+
+:root[data-theme="light"] .ai-reply-btn { background: #ffffff; }
+
+/* --- the whisper bar: how you talk back to him -------------------------- */
+.ai-pyrus-ask {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 5px 5px 8px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.26);
+  border: 1px solid var(--ai-border);
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+:root[data-theme="light"] .ai-pyrus-ask { background: rgba(21, 26, 45, 0.05); }
+
+.ai-pyrus-ask:focus-within {
+  border-color: var(--ai-primary);
+  box-shadow: 0 0 0 3px var(--ai-primary-soft);
+}
+
+.ai-ask-field {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--ai-text-main);
+  font-family: inherit;
+  font-size: 13px;
+  padding: 7px 2px;
+}
+
+.ai-ask-field::placeholder { color: var(--ai-text-dim); }
+
+.ai-ask-point,
+.ai-ask-send {
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  transition: transform 0.18s var(--ai-ease-spring), background 0.18s, color 0.18s, border-color 0.18s;
+}
+
+.ai-ask-point {
+  border: 1px solid var(--ai-border-subtle);
+  background: transparent;
+  color: var(--ai-text-muted);
+}
+
+.ai-ask-point:hover {
+  color: var(--ai-primary);
+  border-color: var(--ai-primary);
+  background: var(--ai-primary-soft);
+}
+
+.ai-ask-point svg { width: 14px; height: 14px; fill: currentColor; }
+
+.ai-ask-send {
+  border: none;
+  background: linear-gradient(135deg, #ff8b32, #f05a0b);
+  color: #fff;
+  box-shadow: 0 4px 12px var(--ai-primary-glow);
+}
+
+.ai-ask-send svg { width: 15px; height: 15px; fill: currentColor; }
+
+.ai-ask-send:hover { transform: translateY(-2px) scale(1.05); }
+
+.ai-ask-send:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* --- who he is and whether he can think right now ----------------------- */
+.ai-pyrus-nameplate {
+  position: absolute;
+  left: 2px;
+  bottom: 30px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  background: var(--ai-bg-glass);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid var(--ai-border-subtle);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.32);
+}
+
+.ai-pyrus-name {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ai-text-main);
+}
+
+.ai-pyrus-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ai-text-dim);
+}
+
+.ai-pyrus-status::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 8px currentColor;
+  animation: aiDotGlow 2s ease-in-out infinite alternate;
+}
+
+.ai-pyrus-status[data-state="ready"] { color: var(--ai-success); }
+.ai-pyrus-status[data-state="nokey"] { color: #ffb44d; }
+.ai-pyrus-status[data-state="offline"] { color: #ff6b6b; }
+
+/* While the detail card is open Pyrus steps back and waits. */
+body.ai-pyrus-card-open .ai-pyrus-scene {
+  opacity: 0.26;
+  filter: blur(2px);
+  pointer-events: none;
+}
+
+body.ai-pyrus-card-open .ai-pyrus-scene * { pointer-events: none; }
+
+/* ==========================================================================
+   3. SMART ELEMENT HIGHLIGHTING & SPOTLIGHT
+   ========================================================================== */
+
+/* Fullpage Dimmer Backdrop */
+.ai-spotlight-dimmer {
+  position: fixed;
+  inset: 0;
+  z-index: 9970;
+  background: rgba(8, 6, 12, 0.58);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.35s ease;
+}
+
+.ai-spotlight-dimmer.active {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+:root[data-theme="light"] .ai-spotlight-dimmer {
+  background: rgba(22, 26, 45, 0.45);
+}
+
+/* Target Element Highlight Outline */
+.ai-highlight-target {
+  position: relative !important;
+  z-index: 9975 !important;
+  outline: 3px solid var(--ai-primary) !important;
+  outline-offset: 4px !important;
+  box-shadow: 0 0 0 7px var(--ai-primary-soft), 0 0 35px var(--ai-primary-glow) !important;
+  border-radius: inherit;
+  transition: outline 0.25s, box-shadow 0.25s !important;
+  animation: aiHighlightPulse 2.4s ease-in-out infinite !important;
+}
+
+@keyframes aiHighlightPulse {
+  0%, 100% {
+    box-shadow: 0 0 0 6px rgba(255, 106, 26, 0.25), 0 0 30px rgba(255, 106, 26, 0.45);
+  }
+  50% {
+    box-shadow: 0 0 0 11px rgba(255, 106, 26, 0.4), 0 0 45px rgba(255, 106, 26, 0.7);
+  }
+}
+
+/* SVG Laser Connector */
+.ai-connector-svg {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 9976;
+  pointer-events: none;
+}
+
+.ai-connector-path {
+  fill: none;
+  stroke: url(#aiBeamGradient);
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  stroke-dasharray: 8 4;
+  animation: aiBeamFlow 1.2s linear infinite;
+  filter: drop-shadow(0 0 6px rgba(255, 106, 26, 0.8));
+}
+
+@keyframes aiBeamFlow {
+  from { stroke-dashoffset: 24; }
+  to { stroke-dashoffset: 0; }
+}
+
+/* ==========================================================================
+   4. THE DETAIL CARD (opened only when the user asks for the full breakdown)
+   ========================================================================== */
+
+.ai-doubt-popup {
+  position: fixed;
+  z-index: 9978;
+  width: min(440px, calc(100vw - 36px));
+  background: var(--ai-bg-glass);
+  backdrop-filter: blur(28px);
+  -webkit-backdrop-filter: blur(28px);
+  border: 1px solid var(--ai-border);
+  border-radius: var(--ai-radius-lg);
+  box-shadow: var(--ai-shadow-popup);
+  color: var(--ai-text-main);
+  font-family: var(--ai-font);
+  overflow: hidden;
+  opacity: 0;
+  transform: translateY(14px) scale(0.96);
+  pointer-events: none;
+  transition: opacity 0.28s var(--ai-ease-spring), transform 0.28s var(--ai-ease-spring);
+}
+
+.ai-doubt-popup.open {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  pointer-events: auto;
+}
+
+.ai-popup-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  background: linear-gradient(90deg, rgba(255, 106, 26, 0.12) 0%, transparent 100%), var(--ai-bg-card);
+  border-bottom: 1px solid var(--ai-border-subtle);
+}
+
+.ai-popup-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ai-primary);
+  background: var(--ai-primary-soft);
+  border: 1px solid rgba(255, 106, 26, 0.35);
+  padding: 4px 10px;
+  border-radius: 999px;
+}
+
+.ai-popup-tag svg {
+  width: 12px;
+  height: 12px;
+  fill: currentColor;
+}
+
+.ai-popup-close {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  color: var(--ai-text-muted);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  font-size: 18px;
+  line-height: 1;
+  transition: all 0.18s;
+}
+
+.ai-popup-close:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--ai-text-main);
+}
+
+.ai-popup-body {
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: min(460px, calc(100vh - 220px));
+  overflow-y: auto;
+}
+
+.ai-popup-title {
+  font-size: 17px;
+  font-weight: 800;
+  letter-spacing: -0.015em;
+  color: var(--ai-text-main);
+  line-height: 1.35;
+}
+
+/* Structured Sections */
+.ai-popup-section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ai-popup-section-label {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ai-primary);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.ai-popup-section-content {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--ai-text-main);
+}
+
+.ai-popup-example-box {
+  background: var(--ai-primary-soft);
+  border-left: 3px solid var(--ai-primary);
+  padding: 9px 12px;
+  border-radius: 0 var(--ai-radius-sm) var(--ai-radius-sm) 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--ai-text-main);
+}
+
+.ai-popup-remember-box {
+  background: rgba(111, 140, 255, 0.1);
+  border: 1px dashed rgba(111, 140, 255, 0.4);
+  padding: 9px 12px;
+  border-radius: var(--ai-radius-sm);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ai-text-muted);
+}
+.ai-popup-remember-box b {
+  color: var(--ai-accent);
+}
+
+/* Footer / Follow-up */
+.ai-popup-footer {
+  padding: 12px 18px;
+  background: var(--ai-bg-card);
+  border-top: 1px solid var(--ai-border-subtle);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.ai-popup-followup-btn {
+  border: 1px solid var(--ai-primary);
+  background: var(--ai-primary-soft);
+  color: var(--ai-primary);
+  padding: 7px 14px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: all 0.2s var(--ai-ease-spring);
+}
+
+.ai-popup-followup-btn:hover {
+  background: var(--ai-primary);
+  color: #fff;
+  transform: translateY(-2px);
+  box-shadow: 0 4px 14px var(--ai-primary-glow);
+}
+
+.ai-popup-sub-btn {
+  border: none;
+  background: transparent;
+  color: var(--ai-text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 6px;
+  transition: color 0.18s;
+}
+
+.ai-popup-sub-btn:hover {
+  color: var(--ai-text-main);
+  text-decoration: underline;
+}
+
+/* ==========================================================================
+   5. POINT & ASK / INSPECT MODE
+   ========================================================================== */
+
+body.ai-inspect-mode {
+  cursor: crosshair !important;
+}
+
+body.ai-inspect-mode * {
+  cursor: crosshair !important;
+}
+
+.ai-inspect-target-hover {
+  outline: 2px dashed #ff9d54 !important;
+  outline-offset: 3px !important;
+  background-color: rgba(255, 106, 26, 0.08) !important;
+  transition: outline 0.12s ease !important;
+}
+
+.ai-inspect-banner {
+  position: fixed;
+  top: 18px;
+  left: 50%;
+  transform: translateX(-50%) translateY(-20px);
+  z-index: 9995;
+  background: var(--ai-bg-glass);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--ai-primary);
+  box-shadow: 0 10px 30px var(--ai-primary-glow);
+  color: var(--ai-text-main);
+  padding: 9px 20px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  opacity: 0;
+  pointer-events: none;
+  transition: all 0.25s var(--ai-ease-spring);
+}
+
+.ai-inspect-banner.show {
+  transform: translateX(-50%) translateY(0);
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.ai-inspect-banner-cancel {
+  border: 1px solid var(--ai-border);
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--ai-text-main);
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.ai-inspect-banner-cancel:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* ==========================================================================
+   6. RESPONSIVE & ACCESSIBILITY
+   ========================================================================== */
+
+/* Laptop screens: shrink him a step so the whole scene still fits. */
+@media (min-width: 769px) and (max-height: 820px) {
+  .ai-pyrus-scene { width: 336px; height: 496px; }
+  .ai-pyrus-speech { width: 268px; max-height: 268px; }
+  .ai-speech-body { max-height: 92px; }
+  .ai-pyrus-body { width: 200px; height: 242px; }
+  .ai-pyrus-halo { width: 280px; height: 280px; }
+}
+
+@media (max-width: 768px) {
+  .ai-fab-container {
+    right: 16px;
+    bottom: 16px;
+  }
+  .ai-fab-btn {
+    width: 54px;
+    height: 54px;
+  }
+  .ai-pyrus-scene {
+    right: 10px;
+    bottom: 80px;
+    width: min(360px, calc(100vw - 20px));
+    height: 460px;
+  }
+  .ai-pyrus-speech {
+    width: 100%;
+    max-height: 250px;
+    padding: 12px 13px 11px;
+  }
+  .ai-speech-body { max-height: 84px; font-size: 13px; }
+  .ai-pyrus-body { width: 184px; height: 222px; }
+  .ai-pyrus-halo { width: 250px; height: 250px; }
+  .ai-pyrus-nameplate { bottom: 12px; left: 0; }
+  .ai-doubt-popup {
+    left: 12px !important;
+    right: 12px !important;
+    bottom: 16px !important;
+    top: auto !important;
+    width: calc(100vw - 24px) !important;
+    transform: translateY(20px) !important;
+    border-radius: 20px 20px 14px 14px !important;
+  }
+  .ai-doubt-popup.open {
+    transform: translateY(0) !important;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ai-fab-btn,
+  .ai-fab-pulse-ring,
+  .ai-pyrus-halo,
+  .ai-pyrus-image,
+  .ai-pyrus-shadow,
+  .ai-pyrus-gaze,
+  .ai-pyrus-motes span,
+  .ai-speech-dots i,
+  .ai-pyrus-status::before,
+  .ai-highlight-target,
+  .ai-connector-path {
+    animation: none !important;
+  }
+  .ai-pyrus-scene,
+  .ai-pyrus-body,
+  .ai-doubt-popup,
+  .ai-fab-tooltip,
+  .ai-spotlight-dimmer {
+    transition: opacity 0.1s linear !important;
+    transform: none !important;
+  }
+  .ai-pyrus-scene { filter: none !important; }
+  /* the light still marks what he is looking at, it just stops travelling */
+  .ai-pyrus-gaze { opacity: 0.6 !important; }
+}

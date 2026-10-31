@@ -1,0 +1,122 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --bg-main: #0b0d10;
+    --bg-surface: #12151a;
+    --bg-surface-elevated: #181c23;
+    --bg-surface-hover: #1f242d;
+    --border-subtle: #1f252e;
+    --border-strong: #2c333f;
+    --brand-orange: #ff5a1f;
+    --brand-orange-hover: #e04a14;
+    --brand-orange-light: rgba(255, 90, 31, 0.12);
+    --brand-green: #00d26a;
+    --brand-green-light: rgba(0, 210, 106, 0.12);
+    --brand-red: #f43f5e;
+    --brand-red-light: rgba(244, 63, 94, 0.12);
+    --text-primary: #ffffff;
+    --text-secondary: #9aa2b1;
+    --text-muted: #5e687a;
+
+    /* Type scale — the single source of truth for text sizing.
+       Same ramp the ported design pages use (designs/*.html), so a React page
+       and a design page read as one product:
+         micro 10 · meta 11/12 · body 13/14 · h4 15 · h3 16 · h2 18 · h1 22-26 */
+    --fs-3xs: 10px; /* uppercase micro-labels, table column heads */
+    --fs-2xs: 11px; /* captions, hints, timestamps */
+    --fs-xs: 12px; /* secondary text, badges */
+    --fs-sm: 13px; /* dense body, nav links */
+    --fs-base: 14px; /* body */
+    --fs-md: 15px; /* h4 */
+    --fs-lg: 16px; /* h3 */
+    --fs-xl: 18px; /* h2 */
+    --fs-2xl: 22px; /* h1 small */
+    --fs-3xl: 26px; /* h1 large */
+
+    --fw-regular: 400;
+    --fw-medium: 500;
+    --fw-semibold: 600;
+    --fw-bold: 700; /* headings stop at 700 — 800 reads as heavy/naive */
+
+    --lh-tight: 1.15; /* h1 */
+    --lh-snug: 1.3; /* h2 */
+    --lh-normal: 1.55; /* body */
+
+    --ls-tight: -0.02em; /* h1 */
+    --ls-snug: -0.01em; /* h2 */
+  }
+
+  body {
+    background-color: var(--bg-main);
+    color: var(--text-primary);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-size: var(--fs-base);
+    line-height: var(--lh-normal);
+    overflow-x: hidden;
+    color-scheme: dark;
+  }
+
+  /* Heading ramp. Declared in `base`, so any Tailwind `text-*` utility a page
+     sets still wins (the utilities layer comes later) — these are the defaults
+     for headings that carry no explicit size, not a override of ones that do. */
+  h1 {
+    font-size: clamp(var(--fs-2xl), 2.2vw, var(--fs-3xl));
+    font-weight: var(--fw-bold);
+    line-height: var(--lh-tight);
+    letter-spacing: var(--ls-tight);
+  }
+  h2 {
+    font-size: var(--fs-xl);
+    font-weight: var(--fw-bold);
+    line-height: var(--lh-snug);
+    letter-spacing: var(--ls-snug);
+  }
+  h3 {
+    font-size: var(--fs-lg);
+    font-weight: var(--fw-semibold);
+    line-height: 1.35;
+    letter-spacing: -0.005em;
+  }
+  h4 {
+    font-size: var(--fs-md);
+    font-weight: var(--fw-semibold);
+    line-height: 1.4;
+  }
+
+  /* Uppercase micro-label — the eyebrow/caption pattern shared by every page. */
+  .text-label {
+    font-size: var(--fs-3xs);
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    line-height: 1;
+  }
+}
+
+/* Custom scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #0e1116;
+}
+::-webkit-scrollbar-thumb {
+  background: #252c38;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #364052;
+}
+
+/* Glowing utilities */
+.glow-orange {
+  box-shadow: 0 0 20px rgba(255, 90, 31, 0.25);
+}
+.glow-green {
+  box-shadow: 0 0 20px rgba(0, 210, 106, 0.2);
+}
+.glow-subtle {
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
+}

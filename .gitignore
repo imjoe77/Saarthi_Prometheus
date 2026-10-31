@@ -1,0 +1,68 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# local dev-server output (`npm run dev` redirected to files)
+/dev.out
+/dev.err
+dev-*.log
+/.logs/
+*.log
+*.log.err
+
+# local editor settings
+/.vscode/
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files
+#
+# `.env*` is ignored wholesale so a new environment file cannot be committed by
+# accident - the failure mode being guarded against is a real secret in history,
+# and once committed it stays there.
+#
+# `.env.example` is the documented exception: it holds no values by definition,
+# and shipping it is the only way a new developer learns what must be configured.
+# The exception is re-stated at the end of the file so it cannot be lost if this
+# block is edited.
+.env*
+!.env.example
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# The env-file exception, restated at the end on purpose: a later `gitignore`
+# negation cannot override a directory-level exclude, and `.env.example` in this
+# directory is tracked on purpose.
+!.env.example
+!**/.env.example
