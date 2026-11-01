@@ -381,3 +381,5 @@ prometheus/
 9. **The public catalogue is authenticated.** Discover requires a session, because
    the API does. It is not reachable by an anonymous visitor, and there is no
    cached public page that would leak it.
+
+   "NOTE":Please refer to final_walkthorugh.md file for further detailed overview of the codebase like schema,steps,etc
