@@ -3,8 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "concurrently -k -n web,api -c cyan,magenta \"npm:dev:web\" \"npm:dev:api\"",
-    "dev:web": "next dev",
+    "dev": "node scripts/dev-guard.mjs && concurrently -k -n web,api -c cyan,magenta \"npm:dev:web\" \"npm:dev:api\"",
+    "dev:web": "node scripts/wait-for-api.mjs && next dev",
     "dev:api": "npm --prefix backend run dev",
     "build": "next build",
     "start": "next start",

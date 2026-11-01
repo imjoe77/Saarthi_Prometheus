@@ -63,6 +63,14 @@ That starts both halves: the Next.js app on <http://localhost:3000> and the
 NestJS API on <http://localhost:3001>, in one terminal with combined output. Use
 `npm run dev:web` or `npm run dev:api` to run just one of them.
 
+Only one dev server may run at a time. `npm run dev` checks first and refuses to
+start if another one is already up, because two Next.js servers cannot share
+this directory — they overwrite each other's route table, every `/api` route
+starts answering with an HTML page, and Auth.js fails with
+`ClientFetchError: Unexpected token '<'`. The web half also waits for the API to
+report healthy before it starts serving, so the first request is a real one
+rather than a proxy call to a backend that is still compiling.
+
 Open <http://localhost:3000>. The landing page is public; `/dashboard`,
 `/portfolio`, `/wallet`, `/strategies`, `/copy-trading`, `/trading-buddy` and
 `/usdt-exchange` require a session and redirect to sign-in.
@@ -76,8 +84,8 @@ Full provider-console walkthrough and the backend-side verification steps are in
 
 | Script | Purpose |
 | --- | --- |
-| `npm run dev` | Next.js on :3000 **and** the NestJS API on :3001 |
-| `npm run dev:web` | Next.js only |
+| `npm run dev` | Next.js on :3000 **and** the NestJS API on :3001. Refuses to start if a dev server is already running. |
+| `npm run dev:web` | Next.js only. Waits for the API to be healthy first. |
 | `npm run dev:api` | NestJS only, from `backend/` |
 | `npm run build` | Production build |
 | `npm run start` | Serve the production build |
@@ -348,7 +356,7 @@ prometheus/
    one page that moves real balances — buy/sell settle atomically against the
    wallet ledger at live market prices.
 5. **No frontend test suite.** See *Scripts*.
-6. **Most pages are still static mock content.** `/wallet`, `/portfolio` and
+6. **Most pages are still static mock content as we need some real working data before deployment for testing.** `/wallet`, `/portfolio` and
    `/strategies` are real end to end. `/dashboard`, `/ember` and the rest still
    render placeholders until the modules that produce their data arrive. The
    Copy Trading page in particular is still a mock — only its **Discover Leaders**

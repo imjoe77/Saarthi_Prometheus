@@ -34,6 +34,23 @@ const API_PREFIX = "api";
 /** Methods the proxy will relay. Anything else is refused without a round trip. */
 const ALLOWED_METHODS = new Set(["GET", "POST", "PATCH", "PUT", "DELETE"]);
 
+/**
+ * How long to wait before each attempt at a GET whose connection was refused.
+ *
+ * `nest start --watch` restarts the backend on every source save, and port 3001
+ * is closed for the whole rebuild-and-bootstrap window - around twenty seconds
+ * of measured downtime. These waits cannot cover that; they exist for the
+ * boundary itself, the instant between the old process letting go of the port
+ * and the new one binding it, where a page would otherwise report "the API is
+ * not reachable" about a backend that answered a millisecond later. A restart
+ * this long is absorbed by the caller retrying the whole read, not here.
+ *
+ * Only GET is retried. A write that was refused before the socket connected is
+ * probably safe to repeat, but "probably" is not good enough for endpoints that
+ * place orders or drive burns: those get one attempt and an honest failure.
+ */
+const GET_CONNECT_DELAYS_MS = [0, 400, 1200] as const;
+
 type RouteContext = { params: Promise<{ path: string[] }> };
 
 export async function GET(request: Request, context: RouteContext) {
@@ -83,22 +100,26 @@ async function proxy(request: Request, context: RouteContext, method: string) {
   let upstream: Response;
 
   try {
-    upstream = await fetch(target, {
-      method,
-      headers: {
-        accept: "application/json",
-        // The browser's own `authorization` and `cookie` headers are never
-        // relayed: the credential used is the one minted above, never one the
-        // caller supplied.
-        ...(contentType ? { "content-type": contentType } : {}),
-        authorization: `Bearer ${token}`,
+    upstream = await fetchUpstream(
+      target,
+      {
+        method,
+        headers: {
+          accept: "application/json",
+          // The browser's own `authorization` and `cookie` headers are never
+          // relayed: the credential used is the one minted above, never one the
+          // caller supplied.
+          ...(contentType ? { "content-type": contentType } : {}),
+          authorization: `Bearer ${token}`,
+        },
+        body,
+        // The API is reached server to server on the same host; a cached answer
+        // would be a different user's answer.
+        cache: "no-store",
+        redirect: "manual",
       },
-      body,
-      // The API is reached server to server on the same host; a cached answer
-      // would be a different user's answer.
-      cache: "no-store",
-      redirect: "manual",
-    });
+      method,
+    );
   } catch (error) {
     // The backend being unreachable is an operational fact, not something to
     // pass to the browser as though it came from the API.
@@ -107,6 +128,31 @@ async function proxy(request: Request, context: RouteContext, method: string) {
   }
 
   return relay(upstream);
+}
+
+/** Sends the request, retrying a refused connection while the method is safe to. */
+async function fetchUpstream(target: URL, init: RequestInit, method: string): Promise<Response> {
+  const delays = method === "GET" ? GET_CONNECT_DELAYS_MS : ([0] as readonly number[]);
+  let lastError: unknown;
+
+  for (const delay of delays) {
+    if (delay > 0) await sleep(delay);
+
+    try {
+      return await fetch(target, init);
+    } catch (error) {
+      // A rejected `fetch` is a transport failure: the request never completed,
+      // so nothing was read and nothing was written. Anything the backend
+      // answered - even a 500 - is a real response and is returned as-is.
+      lastError = error;
+    }
+  }
+
+  throw lastError;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**

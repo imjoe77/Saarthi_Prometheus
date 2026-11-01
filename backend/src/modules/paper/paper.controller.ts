@@ -15,6 +15,7 @@ import type { PaperOrder } from '@prisma/client';
 import type { AuthContext } from '../auth/auth.service';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { StrategyService } from '../strategy/strategy.service';
+import { WalletService } from '../wallet/wallet.service';
 import { PlacePaperOrderDto } from './dto/place-paper-order.dto';
 import { PaperAccountResponseDto, PaperPositionResponseDto, PaperSummaryResponseDto } from './dto/paper-account-response.dto';
 import { PaperOrderResponseDto } from './dto/paper-order-response.dto';
@@ -26,8 +27,9 @@ import { PaperService } from './paper.service';
  *
  * THE POST RETURNS 201 IN BOTH CASES. A fill produces status FILLED; a refused
  * request produces status REJECTED with a rejectReason and the row is persisted.
- * Only "strategy not visible/not owned", "unknown symbol" or routing errors map
- * to 4xx/5xx; the decision outcome is a committed order row returned 201.
+ * Only "strategy not visible/not owned", "unknown symbol", "nothing to close"
+ * or routing errors map to 4xx/5xx; the decision outcome is a committed order
+ * row returned 201.
  *
  * OWNER-ONLY WITHOUT EXCEPTION. Every route resolves the strategy through
  * `StrategyService.findOwned` before reading a single row. A strategy that
@@ -43,12 +45,15 @@ export class PaperController {
     private readonly paperExecutionService: PaperExecutionService,
     private readonly paperService: PaperService,
     private readonly strategyService: StrategyService,
+    private readonly walletService: WalletService,
   ) {}
 
   @Post('orders')
   @ApiOperation({
     summary: 'Place a market order on a paper strategy',
-    description: 'Market order, long-only. Returns 201 with FILLED or REJECTED. Idempotent on (strategyId, clientRequestId).',
+    description:
+      'Market order, LONG or SHORT. Returns 201 with FILLED or REJECTED. Idempotent on (strategyId, clientRequestId). ' +
+      "The trader's real USDT balance must cover the order's notional, or the order is recorded as refused.",
   })
   @ApiCreatedResponse({ type: PaperOrderResponseDto })
   @ApiBadRequestResponse({ description: 'Unknown symbol, zero quantity or invalid request.' })
@@ -69,6 +74,24 @@ export class PaperController {
     return PaperOrderResponseDto.from(order);
   }
 
+  @Post('positions/:symbol/close')
+  @ApiOperation({
+    summary: 'Close an open paper position at the live market price',
+    description:
+      'The position is closed by an ordinary order in the opposite direction, at the position\'s own quantity, ' +
+      'under the same price and wallet rules as any other order. 404 when the strategy holds no position for that symbol.',
+  })
+  @ApiCreatedResponse({ type: PaperOrderResponseDto })
+  @ApiNotFoundResponse({ description: 'Strategy not found or not owned, or no open position for the symbol.' })
+  async closePosition(
+    @CurrentUser() user: AuthContext,
+    @Param('strategyId', new ParseUUIDPipe()) strategyId: string,
+    @Param('symbol') symbol: string,
+  ): Promise<PaperOrderResponseDto> {
+    const order = await this.paperExecutionService.closePosition(user.id, strategyId, symbol);
+    return PaperOrderResponseDto.from(order);
+  }
+
   @Get('orders')
   @ApiOperation({ summary: 'List recent paper orders for a strategy', description: 'Most recent first, owner-only.' })
   @ApiOkResponse({ type: [PaperOrderResponseDto] })
@@ -84,10 +107,11 @@ export class PaperController {
 
   @Get('account')
   @ApiOperation({
-    summary: 'Paper cash account and open positions for a strategy',
+    summary: 'Paper cash account, open positions marked at the market, and the wallet USDT balance',
     description:
       'Owner-only. `account` is null until the first order provisions the paper account; `positions` is empty for a strategy that has never held one. ' +
-      'Realized P&L is the ledger figure for closed SELLs only - no unrealised mark is invented here.',
+      'Each position carries its direction, the mark it was priced at, its market value and its unrealised P&L - null when the feed produced no price. ' +
+      '`walletUsdt` is the trader\'s real USDT balance, which every order\'s notional has to be covered by.',
   })
   @ApiOkResponse({ type: PaperSummaryResponseDto })
   @ApiNotFoundResponse({ description: 'Strategy not found or not owned.' })
@@ -96,15 +120,13 @@ export class PaperController {
     @Param('strategyId', new ParseUUIDPipe()) strategyId: string,
   ): Promise<PaperSummaryResponseDto> {
     await this.owned(user, strategyId);
-    const [account, positions] = await Promise.all([
+    const [account, positions, walletUsdt] = await Promise.all([
       this.paperService.getAccount(strategyId),
-      this.paperService.getPositions(strategyId),
+      this.paperService.getMarkedPositions(strategyId),
+      this.walletService.getAvailableBalance(user.id, 'USDT'),
     ]);
 
-    return {
-      account: account ? PaperAccountResponseDto.from(account) : null,
-      positions: positions.map((p) => PaperPositionResponseDto.from(p)),
-    };
+    return PaperSummaryResponseDto.from({ account, positions, walletUsdt });
   }
 
   /** Resolves ownership so a read can never cross a strategy boundary. */

@@ -7,6 +7,7 @@ import {
   ParseUUIDPipe,
   Post,
   Param,
+  Query,
   Res,
 } from '@nestjs/common';
 import {
@@ -27,6 +28,9 @@ import { CreateAllocationDto } from './dto/create-allocation.dto';
 import { CreateBuybackDto } from './dto/create-buyback.dto';
 import { CreateBurnDto } from './dto/create-burn.dto';
 import { ExecuteBuybackDto } from './dto/execute-buyback.dto';
+import { ExchangeRevenueService } from './exchange-revenue.service';
+import { ExchangeRevenueWorkerService } from './exchange-revenue-worker.service';
+import { ExchangeRevenueSummaryResponseDto } from './dto/exchange-revenue-summary-response.dto';
 import { PreviewAllocationDto } from './dto/preview-allocation.dto';
 import { TokenAllocationResponseDto } from './dto/token-allocation-response.dto';
 import { TokenBuybackResponseDto } from './dto/token-buyback-response.dto';
@@ -51,11 +55,18 @@ import { TokenomicsService } from './tokenomics.service';
  * idempotent replay, matching Modules 08-10. `POST /preview` always answers
  * 200: it computes and writes nothing, because only burns change supply.
  */
+/** Recent exchange revenue rows returned by the summary when no limit is asked for. */
+const DEFAULT_RECENT_LIMIT = 20;
+
 @ApiTags('tokenomics')
 @ApiBearerAuth()
 @Controller('tokenomics')
 export class TokenomicsController {
-  constructor(private readonly tokenomicsService: TokenomicsService) {}
+  constructor(
+    private readonly tokenomicsService: TokenomicsService,
+    private readonly exchangeRevenueService: ExchangeRevenueService,
+    private readonly exchangeRevenueWorker: ExchangeRevenueWorkerService,
+  ) {}
 
   @Get('config')
   @ApiOperation({
@@ -169,10 +180,40 @@ export class TokenomicsController {
   @ApiOperation({
     summary: "The caller's own tokenomics records, newest first",
     description:
-      'Allocations, simulated buybacks and burns recorded by the caller, each list bounded to the 50 most recent entries. Per-caller like every other listing: there is no admin role through which one user could read anotherâ€™s records. Global supply figures come from GET /ember/supply instead - the two reconcile because every burn listed here corresponds to exactly one BURN ledger leg.',
+      'Allocations, simulated buybacks and burns recorded by the caller, each list bounded to the 50 most recent entries. Per-caller like every other listing: there is no admin role through which one user could read another records. Global supply figures come from GET /ember/supply instead - the two reconcile because every burn listed here corresponds to exactly one BURN ledger leg.',
   })
   @ApiOkResponse({ type: TokenomicsRecordsResponseDto })
   async records(@CurrentUser() user: AuthContext): Promise<TokenomicsRecordsResponseDto> {
     return TokenomicsRecordsResponseDto.from(await this.tokenomicsService.records(user.id));
+  }
+
+  // -------------------------------------------------------------------------
+  // Module 08 x Module 11 - the exchange side of the ledger
+  // -------------------------------------------------------------------------
+
+  @Get('exchange-revenue')
+  @ApiOperation({
+    summary: 'What settled USDT orders have fed into the burn/buyback engine',
+    description:
+      'Every settled USDT order the tokenomics pipeline was asked to consider, with the revenue decision that was made about it and the records it produced. Readable by any authenticated caller like the other GET routes. Each row states its own reason, including the reasons nothing was allocated: under the shipped configuration the exchange retains no INR after paying liquidity providers, so revenue is zero and the honest answer is the reason code, not a silent blank. Burn totals are split by on-chain state because an off-chain ledger burn and a confirmed Sepolia burn are different claims.',
+  })
+  @ApiOkResponse({ type: ExchangeRevenueSummaryResponseDto })
+  async exchangeRevenue(@Query('limit') limit?: string): Promise<ExchangeRevenueSummaryResponseDto> {
+    const parsed = limit === undefined ? DEFAULT_RECENT_LIMIT : Number.parseInt(limit, 10);
+    return ExchangeRevenueSummaryResponseDto.from(
+      await this.exchangeRevenueService.summary(Number.isFinite(parsed) ? parsed : DEFAULT_RECENT_LIMIT),
+    );
+  }
+
+  @Post('exchange-revenue/run-once')
+  @Roles(Role.PLATFORM_ADMIN)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Run one exchange revenue pass now',
+    description:
+      'Drains the settled-order queue through allocation, buyback, execution and burn without waiting for the background tick. Same code the worker runs, so it is a schedule shortcut and not a different path: an order already processed is not processed twice, and an order blocked by a treasury guardrail reports the same refusal. PLATFORM_ADMIN only, because it drives burns.',
+  })
+  async runExchangeRevenue(): Promise<{ processed: number }> {
+    return { processed: await this.exchangeRevenueWorker.runOnce() };
   }
 }

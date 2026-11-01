@@ -7,8 +7,12 @@ import {
   CandlestickSeries,
   HistogramSeries,
   createChart,
+  createSeriesMarkers,
   type IChartApi,
   type ISeriesApi,
+  type ISeriesMarkersPluginApi,
+  type SeriesMarker,
+  type Time,
   type UTCTimestamp,
 } from "lightweight-charts";
 
@@ -37,6 +41,20 @@ import type { BarDto } from "@/lib/api-client";
 interface StrategyChartProps {
   bars: BarDto[];
   height?: number;
+  /**
+   * Fills drawn on the series. A price on its own is a number; a price on a
+   * candle is a trade, and the arrow says which way it went.
+   */
+  markers?: ChartMarker[];
+}
+
+/** One fill, placed on the candle it happened in. */
+export interface ChartMarker {
+  /** The bar the marker sits on, in seconds since the epoch. */
+  time: UTCTimestamp;
+  side: "LONG" | "SHORT";
+  /** The label drawn beside the marker. */
+  text?: string;
 }
 
 interface CandlePoint {
@@ -56,11 +74,12 @@ interface VolumePoint {
 const UP_COLOR = "#00D26A";
 const DOWN_COLOR = "#FF4D4D";
 
-export function StrategyChart({ bars, height = 420 }: StrategyChartProps) {
+export function StrategyChart({ bars, height = 420, markers }: StrategyChartProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const volumeRef = useRef<ISeriesApi<"Histogram"> | null>(null);
+  const markerRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -116,6 +135,7 @@ export function StrategyChart({ bars, height = 420 }: StrategyChartProps) {
     chartRef.current = chart;
     candleRef.current = candles;
     volumeRef.current = volume;
+    markerRef.current = createSeriesMarkers(candles, []);
 
     const observer = new ResizeObserver((entries) => {
       const width = entries[0]?.contentRect.width;
@@ -131,6 +151,7 @@ export function StrategyChart({ bars, height = 420 }: StrategyChartProps) {
       chartRef.current = null;
       candleRef.current = null;
       volumeRef.current = null;
+      markerRef.current = null;
     };
   }, [height]);
 
@@ -173,6 +194,29 @@ export function StrategyChart({ bars, height = 420 }: StrategyChartProps) {
     volume.setData(volumeData);
     chart.timeScale().fitContent();
   }, [bars]);
+
+  /**
+   * The fills are drawn on the series, not beside it. A marker whose time is
+   * outside the loaded window is simply not drawn - the chart never stretches
+   * a window to make a marker fit.
+   */
+  useEffect(() => {
+    const plugin = markerRef.current;
+    if (!plugin) return;
+
+    const list: SeriesMarker<Time>[] = (markers ?? []).map((marker) => {
+      const isLong = marker.side === "LONG";
+      return {
+        time: marker.time,
+        position: isLong ? "belowBar" : "aboveBar",
+        shape: isLong ? "arrowUp" : "arrowDown",
+        color: isLong ? UP_COLOR : DOWN_COLOR,
+        text: marker.text ?? marker.side,
+      };
+    });
+
+    plugin.setMarkers(list);
+  }, [markers]);
 
   return <div ref={containerRef} style={{ width: "100%", height }} aria-label="Candlestick chart" />;
 }

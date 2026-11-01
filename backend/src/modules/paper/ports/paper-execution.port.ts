@@ -16,7 +16,7 @@ export interface PaperFill {
   readonly orderId: string;
   readonly strategyId: string;
   readonly symbol: string;
-  readonly side: 'BUY' | 'SELL';
+  readonly side: 'LONG' | 'SHORT';
   readonly quantity: Prisma.Decimal;
   readonly fillPrice: Prisma.Decimal;
   readonly filledAt: Date;

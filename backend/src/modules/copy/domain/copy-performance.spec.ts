@@ -9,11 +9,16 @@ import { replayCopyLedger, type CopyLedgerEvent } from './copy-performance';
  * WITH IT. Every expectation here is the number `CopyExecutionService` would
  * have stored in `copy_accounts.realized_pnl`, so a change to the replay that
  * would make a screen disagree with the database fails here first.
+ *
+ * THE BOOK IS NET, AND THE REPLAY CALLS THE ENGINE'S OWN KERNEL. A LONG or a
+ * SHORT is applied to whatever the book already holds, so a SHORT against a
+ * flat book opens a short and realises nothing, while a LONG against a short
+ * closes it and realises the difference.
  */
 describe('replayCopyLedger', () => {
   const dec = (value: string): Prisma.Decimal => new Prisma.Decimal(value);
 
-  function event(overrides: Partial<CopyLedgerEvent> & { side: 'BUY' | 'SELL' }): CopyLedgerEvent {
+  function event(overrides: Partial<CopyLedgerEvent> & { side: 'LONG' | 'SHORT' }): CopyLedgerEvent {
     return {
       followerId: 'follower-1',
       strategyId: 'strategy-1',
@@ -29,8 +34,8 @@ describe('replayCopyLedger', () => {
     };
   }
 
-  it('realises nothing on a buy', () => {
-    const result = replayCopyLedger([event({ side: 'BUY' })]);
+  it('realises nothing on a long', () => {
+    const result = replayCopyLedger([event({ side: 'LONG' })]);
 
     expect(result.realizedPnl.toString()).toBe('0');
     expect(result.points[0]?.realizedPnl.toString()).toBe('0');
@@ -39,9 +44,9 @@ describe('replayCopyLedger', () => {
 
   it('realises the difference between the entry and the exit', () => {
     const result = replayCopyLedger([
-      event({ side: 'BUY', quantity: dec('2'), fillPrice: dec('100'), gross: dec('200') }),
+      event({ side: 'LONG', quantity: dec('2'), fillPrice: dec('100'), gross: dec('200') }),
       event({
-        side: 'SELL',
+        side: 'SHORT',
         quantity: dec('2'),
         fillPrice: dec('110'),
         gross: dec('220'),
@@ -54,11 +59,11 @@ describe('replayCopyLedger', () => {
     expect(result.points[1]?.cumulativePnl.toString()).toBe('20');
   });
 
-  it('averages the entry price across two buys', () => {
+  it('averages the entry price across two longs', () => {
     const result = replayCopyLedger([
-      event({ side: 'BUY', quantity: dec('1'), fillPrice: dec('100'), gross: dec('100') }),
+      event({ side: 'LONG', quantity: dec('1'), fillPrice: dec('100'), gross: dec('100') }),
       event({
-        side: 'BUY',
+        side: 'LONG',
         quantity: dec('1'),
         fillPrice: dec('200'),
         gross: dec('200'),
@@ -66,7 +71,7 @@ describe('replayCopyLedger', () => {
         expertFilledAt: new Date('2026-01-02T00:00:00.000Z'),
       }),
       event({
-        side: 'SELL',
+        side: 'SHORT',
         quantity: dec('2'),
         fillPrice: dec('180'),
         gross: dec('360'),
@@ -75,15 +80,15 @@ describe('replayCopyLedger', () => {
       }),
     ]);
 
-    // The average entry is 150, so selling 2 at 180 realises (180 - 150) * 2.
+    // The average entry is 150, so closing 2 at 180 realises (180 - 150) * 2.
     expect(result.realizedPnl.toString()).toBe('60');
   });
 
-  it('keeps the average entry when a position is partly sold', () => {
+  it('keeps the average entry when a position is partly closed', () => {
     const result = replayCopyLedger([
-      event({ side: 'BUY', quantity: dec('2'), fillPrice: dec('100'), gross: dec('200') }),
+      event({ side: 'LONG', quantity: dec('2'), fillPrice: dec('100'), gross: dec('200') }),
       event({
-        side: 'SELL',
+        side: 'SHORT',
         quantity: dec('1'),
         fillPrice: dec('120'),
         gross: dec('120'),
@@ -91,7 +96,7 @@ describe('replayCopyLedger', () => {
         expertFilledAt: new Date('2026-01-02T00:00:00.000Z'),
       }),
       event({
-        side: 'SELL',
+        side: 'SHORT',
         quantity: dec('1'),
         fillPrice: dec('130'),
         gross: dec('130'),
@@ -100,16 +105,16 @@ describe('replayCopyLedger', () => {
       }),
     ]);
 
-    // Both sells price against the original 100, not against a running average
-    // of a shrinking position.
+    // Both closes price against the original 100, not against a running
+    // average of a shrinking position.
     expect(result.realizedPnl.toString()).toBe('50');
   });
 
   it('starts a fresh average after a position empties', () => {
     const result = replayCopyLedger([
-      event({ side: 'BUY', quantity: dec('1'), fillPrice: dec('100'), gross: dec('100') }),
+      event({ side: 'LONG', quantity: dec('1'), fillPrice: dec('100'), gross: dec('100') }),
       event({
-        side: 'SELL',
+        side: 'SHORT',
         quantity: dec('1'),
         fillPrice: dec('150'),
         gross: dec('150'),
@@ -117,7 +122,7 @@ describe('replayCopyLedger', () => {
         expertFilledAt: new Date('2026-01-02T00:00:00.000Z'),
       }),
       event({
-        side: 'BUY',
+        side: 'LONG',
         quantity: dec('1'),
         fillPrice: dec('300'),
         gross: dec('300'),
@@ -125,7 +130,7 @@ describe('replayCopyLedger', () => {
         expertFilledAt: new Date('2026-01-03T00:00:00.000Z'),
       }),
       event({
-        side: 'SELL',
+        side: 'SHORT',
         quantity: dec('1'),
         fillPrice: dec('320'),
         gross: dec('320'),
@@ -136,15 +141,15 @@ describe('replayCopyLedger', () => {
 
     // 150 - 100 = 50 on the first round, 320 - 300 = 20 on the second. A
     // replay that averaged across the closed lot would report 70 on the last
-    // sell, which is a number the ledger does not hold.
+    // close, which is a number the ledger does not hold.
     expect(result.realizedPnl.toString()).toBe('70');
   });
 
   it('ignores a refusal entirely', () => {
     const result = replayCopyLedger([
-      event({ side: 'BUY', quantity: dec('1'), fillPrice: dec('100'), gross: dec('100') }),
+      event({ side: 'LONG', quantity: dec('1'), fillPrice: dec('100'), gross: dec('100') }),
       event({
-        side: 'SELL',
+        side: 'SHORT',
         quantity: null,
         fillPrice: null,
         gross: null,
@@ -160,11 +165,11 @@ describe('replayCopyLedger', () => {
     expect(result.points).toHaveLength(1);
   });
 
-  it('books a sell with no position the way the engine books it', () => {
+  it('books a short against a flat book the way the engine books it', () => {
     const result = replayCopyLedger([
-      event({ side: 'BUY', quantity: dec('1'), fillPrice: dec('100'), gross: dec('100') }),
+      event({ side: 'LONG', quantity: dec('1'), fillPrice: dec('100'), gross: dec('100') }),
       event({
-        side: 'SELL',
+        side: 'SHORT',
         strategyId: 'strategy-2',
         quantity: dec('1'),
         fillPrice: dec('900'),
@@ -174,28 +179,44 @@ describe('replayCopyLedger', () => {
       }),
     ]);
 
-    // The second follow never bought anything. The engine's SELL path reads a
-    // missing position as a zero holding and a zero entry price, so it books
-    // the full 900 - and the replay books the same 900, because the two must
-    // agree on every row, not only on the reachable ones.
-    expect(result.realizedPnl.toString()).toBe('900');
+    // The second follow never bought anything, so its short opens against a
+    // flat book and realises nothing. The engine books the same zero, because
+    // the two must agree on every row, not only on the reachable ones.
+    expect(result.realizedPnl.toString()).toBe('0');
+  });
+
+  it('realises the gain when a long closes a short', () => {
+    const result = replayCopyLedger([
+      event({ side: 'SHORT', quantity: dec('1'), fillPrice: dec('100'), gross: dec('100') }),
+      event({
+        side: 'LONG',
+        quantity: dec('1'),
+        fillPrice: dec('90'),
+        gross: dec('90'),
+        expertOrderId: 'order-2',
+        expertFilledAt: new Date('2026-01-02T00:00:00.000Z'),
+      }),
+    ]);
+
+    // Closing a short at 90 against an entry of 100 realises 100 - 90.
+    expect(result.realizedPnl.toString()).toBe('10');
   });
 
   it('replays in the engine\'s order, not the order it was handed', () => {
     const result = replayCopyLedger([
       event({
-        side: 'SELL',
+        side: 'SHORT',
         quantity: dec('1'),
         fillPrice: dec('150'),
         gross: dec('150'),
         expertOrderId: 'order-2',
         expertFilledAt: new Date('2026-01-02T00:00:00.000Z'),
       }),
-      event({ side: 'BUY', quantity: dec('1'), fillPrice: dec('100'), gross: dec('100') }),
+      event({ side: 'LONG', quantity: dec('1'), fillPrice: dec('100'), gross: dec('100') }),
     ]);
 
-    expect(result.points[0]?.side).toBe('BUY');
-    expect(result.points[1]?.side).toBe('SELL');
+    expect(result.points[0]?.side).toBe('LONG');
+    expect(result.points[1]?.side).toBe('SHORT');
     expect(result.realizedPnl.toString()).toBe('50');
   });
 });

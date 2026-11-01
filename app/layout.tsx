@@ -45,11 +45,18 @@ export default function RootLayout({
             when it initialises and would otherwise default to the backend's
             address on localhost:3001 — which the browser must never learn.
             Set before any body content so it is in place ahead of the widget,
-            however a page loads it. Relative URLs resolve through the BFF. */}
+            however a page loads it. Relative URLs resolve through the BFF.
+
+            `copyEndpoint` is the authenticated ledger route: it answers
+            questions about the caller's own copy trades from the copy module's
+            own records, so the widget asks it first and falls back to the
+            general knowledge base when the caller's book holds no answer. It
+            goes through the session-carrying BFF proxy, never straight to the
+            backend, so the token never leaves the server. */}
         <script
           dangerouslySetInnerHTML={{
             __html:
-              'window.PROMETHEUS_AI_CONFIG = { apiEndpoint: "/api/ai-doubt-solver", modelName: "Prometheus AI" };',
+              'window.PROMETHEUS_AI_CONFIG = { apiEndpoint: "/api/ai-doubt-solver", copyEndpoint: "/api/backend/copy/explain", modelName: "Prometheus AI" };',
           }}
         />
         <AuthSessionProvider>
@@ -71,7 +78,7 @@ export default function RootLayout({
             every route, public ones included. The bridge loader is idempotent
             (`__PrometheusAIDoubtSolverScriptLoaded`), so the design pages that
             still inline `/trade-buddy.js` cannot mount a second copy. */}
-        <Script src="/trade-buddy.js" strategy="afterInteractive" />
+        <Script src="/trade-buddy.js?v=2" strategy="afterInteractive" />
       </body>
     </html>
   );

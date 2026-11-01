@@ -7,6 +7,7 @@ import { DomainException } from '../../common/errors/domain.exception';
 import { PrismaService } from '../../database/prisma.service';
 import { normaliseAmount } from '../wallet/decimal.util';
 import { WalletService } from '../wallet/wallet.service';
+import { ExchangeRevenueService } from '../tokenomics/exchange-revenue.service';
 import {
   LiquidityAllocationService,
   type BuyAllocationOutcome,
@@ -89,6 +90,13 @@ export class UsdtService {
     private readonly walletService: WalletService,
     private readonly pricingService: UsdtPricingService,
     private readonly liquidityAllocation: LiquidityAllocationService,
+    /**
+     * The Module 08 x Module 11 bridge. Called inside the settlement
+     * transaction to record what the order did; it decides nothing about
+     * whether the order happens, and a policy failure is recorded rather than
+     * allowed to break the exchange.
+     */
+    private readonly exchangeRevenue: ExchangeRevenueService,
   ) {}
 
   /** Prices a USDT amount from live market data (or a labelled fallback). */
@@ -163,6 +171,24 @@ export class UsdtService {
                 inrAssetId: inrAsset.id,
               })
             : { legacy: true, slices: [] };
+
+        // MODULE 08 x MODULE 11. One row saying what this settlement did,
+        // written in the same transaction so an order that never committed can
+        // never be read as having funded anything. The revenue decision itself
+        // belongs to the tokenomics module; this call only reports facts about
+        // money that moved here, and cannot make the order fail.
+        await this.exchangeRevenue.recordSettlement(tx, {
+          orderId,
+          userId,
+          side,
+          usdtAmount,
+          customerInr: inrAmount,
+          lpInrSettled: liquidity.slices.reduce(
+            (sum, slice) => sum.plus(slice.inrAmount),
+            new Prisma.Decimal(0),
+          ),
+          lpBacked: liquidity.legacy === false,
+        });
 
         return { order, liquidity };
       });

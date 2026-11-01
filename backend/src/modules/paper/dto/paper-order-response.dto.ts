@@ -13,7 +13,7 @@ export class PaperOrderResponseDto {
   @ApiProperty({ description: 'Symbol.' })
   symbol!: string;
 
-  @ApiProperty({ enum: ['BUY', 'SELL'] })
+  @ApiProperty({ enum: ['LONG', 'SHORT'] })
   side!: string;
 
   @ApiProperty({ description: 'Quantity as a string, exact.' })
@@ -22,11 +22,26 @@ export class PaperOrderResponseDto {
   @ApiProperty({ enum: ['FILLED', 'REJECTED'] })
   status!: string;
 
-  @ApiPropertyOptional({ enum: ['MARKET_DATA_UNAVAILABLE', 'STALE_MARKET_DATA', 'MARKET_CLOSED', 'INSUFFICIENT_PAPER_CASH', 'INSUFFICIENT_POSITION'], nullable: true })
+  @ApiPropertyOptional({
+    enum: [
+      'MARKET_DATA_UNAVAILABLE',
+      'STALE_MARKET_DATA',
+      'MARKET_CLOSED',
+      'INSUFFICIENT_PAPER_CASH',
+      'INSUFFICIENT_WALLET_BALANCE',
+    ],
+    nullable: true,
+  })
   rejectReason!: string | null;
 
   @ApiPropertyOptional({ nullable: true })
   fillPrice!: string | null;
+
+  @ApiPropertyOptional({
+    description: 'Profit or loss this order realised against the position it reduced. Null when it realised nothing.',
+    nullable: true,
+  })
+  realizedPnl!: string | null;
 
   @ApiProperty()
   placedAt!: string;
@@ -47,6 +62,7 @@ export class PaperOrderResponseDto {
       status: order.status,
       rejectReason: order.rejectReason ?? null,
       fillPrice: order.fillPrice ? decimalString(order.fillPrice) : null,
+      realizedPnl: order.realizedPnl ? decimalString(order.realizedPnl) : null,
       placedAt: order.placedAt.toISOString(),
       filledAt: order.filledAt ? order.filledAt.toISOString() : null,
       clientRequestId: order.clientRequestId,

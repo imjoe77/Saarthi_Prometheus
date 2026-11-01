@@ -25,7 +25,10 @@ import {
 
 import type { AuthContext } from '../auth/auth.service';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
+import { DomainException } from '../../common/errors/domain.exception';
+import { decimalString } from '../market-data/domain/decimal-string';
 import { CopyWorkerService } from './copy-worker.service';
+import { CopyExplainerService } from './copy-explainer.service';
 import { CopyService } from './copy.service';
 import {
   CopyEventPageDto,
@@ -45,11 +48,20 @@ import {
 import { CopyPageQueryDto } from './dto/copy-page-query.dto';
 import { CreateFollowDto } from './dto/create-follow.dto';
 import {
+  CopyExplanationResponseDto,
+  ExplainCopyDto,
+} from './dto/explain-copy.dto';
+import {
   FollowPageDto,
   FollowResponseDto,
   FollowerPageDto,
   FollowerResponseDto,
 } from './dto/follow-response.dto';
+import {
+  ConnectExpertResponseDto,
+  ExpertChatMessageDto,
+  ExpertChatResponseDto,
+} from './dto/connect-expert.dto';
 import { UpdateFollowConfigDto } from './dto/update-follow-config.dto';
 
 /**
@@ -91,6 +103,7 @@ export class CopyController {
   constructor(
     private readonly copyService: CopyService,
     private readonly copyWorkerService: CopyWorkerService,
+    private readonly copyExplainerService: CopyExplainerService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -298,7 +311,9 @@ export class CopyController {
     summary: 'Copy cash and positions for one follow',
     description:
       'Null account until the first eligible fill provisions it. Never Module 03 money and never the expert\'s paper ' +
-      'account: each follow holds its own simulated pot.',
+      'account: each follow holds its own simulated pot. Positions are marked at the market, so each one reports ' +
+      'what it is worth and what it would realise if closed now. `walletUsdt` is the caller\'s real balance, which ' +
+      'is the gate every further copy has to pass.',
   })
   @ApiOkResponse({ type: CopyFollowAccountResponseDto })
   @ApiNotFoundResponse({ description: 'No such follow for this caller.' })
@@ -306,11 +321,12 @@ export class CopyController {
     @CurrentUser() user: AuthContext,
     @Param('strategyId', new ParseUUIDPipe()) strategyId: string,
   ): Promise<CopyFollowAccountResponseDto> {
-    const { account, positions } = await this.copyService.getFollowAccount(user.id, strategyId);
+    const { account, positions, walletUsdt } = await this.copyService.getFollowAccount(user.id, strategyId);
 
     return {
       account: account === null ? null : CopyAccountResponseDto.from(account),
       positions: positions.map((position) => CopyPositionResponseDto.from(position)),
+      walletUsdt: decimalString(walletUsdt),
     };
   }
 
@@ -319,12 +335,78 @@ export class CopyController {
     summary: "The caller's copy cash across every follow",
     description:
       'A sum of separate pots, not one pooled balance - `followCount` is part of the answer for exactly that reason. ' +
-      'Positions are merged per symbol with a quantity-weighted average entry. No unrealised mark: this is a ledger ' +
-      'read, and pricing it would need a quote this module deliberately does not fetch.',
+      'Positions are merged per symbol AND direction, so a long and a short in the same instrument stay two rows. ' +
+      'Each row is marked at the market. `walletUsdt` is the caller\'s real balance, the gate every further copy ' +
+      'has to pass.',
   })
   @ApiOkResponse({ type: CopyAggregateAccountResponseDto })
   async aggregateAccount(@CurrentUser() user: AuthContext): Promise<CopyAggregateAccountResponseDto> {
     return CopyAggregateAccountResponseDto.from(await this.copyService.getAggregateAccount(user.id));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Explanation
+  // ---------------------------------------------------------------------------
+
+  @Post('explain')
+  // An explanation is an answer, not a resource that was created, so 200.
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: "Explain one of the caller's copy trades",
+    description:
+      "Answers \"why was it short at this point?\", \"why did it sell here?\", \"why was that not copied?\" and \"why is my size different?\" " +
+      "from the caller's own copy ledger - the fills, their directions, prices, sizes, allocations, outcomes and refusal reasons, " +
+      "and the positions they produced. " +
+      'The caller may point at a market or a row; every fact in the answer is read server-side from the ledger, so nothing the request carries can put a number into the answer. ' +
+      '404 when the caller holds no copy book that could answer the question, which is the signal to fall back to a general explanation.',
+  })
+  @ApiOkResponse({ type: CopyExplanationResponseDto })
+  @ApiNotFoundResponse({ description: 'The caller holds nothing in the copy book that could answer this question.' })
+  async explain(
+    @CurrentUser() user: AuthContext,
+    @Body() body: ExplainCopyDto,
+  ): Promise<CopyExplanationResponseDto> {
+    const explanation = await this.copyExplainerService.explain(
+      user.id,
+      body.query,
+      body.symbol ?? null,
+      body.focusId ?? null,
+    );
+
+    if (explanation === null) {
+      throw DomainException.notFound('An explanation for this copy book');
+    }
+
+    return explanation;
+  }
+
+  @Post('strategies/:strategyId/connect-expert')
+  @ApiOperation({
+    summary: 'Directly connect and unlock consultation with an expert trader for 10 EMBER',
+    description:
+      'Deducts 10 EMBER from the caller\'s wallet and unlocks a direct 1-on-1 consultation session with the expert behind this strategy.',
+  })
+  @ApiCreatedResponse({ type: ConnectExpertResponseDto })
+  async connectExpert(
+    @CurrentUser() user: AuthContext,
+    @Param('strategyId', new ParseUUIDPipe()) strategyId: string,
+  ): Promise<ConnectExpertResponseDto> {
+    return this.copyService.connectExpert(user.id, strategyId);
+  }
+
+  @Post('strategies/:strategyId/expert-chat')
+  @ApiOperation({
+    summary: 'Send a message to the expert trader in an unlocked consultation session',
+    description:
+      'Receives guidance and trade explanations directly tailored to this strategy and market movements.',
+  })
+  @ApiOkResponse({ type: ExpertChatResponseDto })
+  async expertChat(
+    @CurrentUser() user: AuthContext,
+    @Param('strategyId', new ParseUUIDPipe()) strategyId: string,
+    @Body() body: ExpertChatMessageDto,
+  ): Promise<ExpertChatResponseDto> {
+    return this.copyService.chatWithExpert(user.id, strategyId, body.message);
   }
 
   // ---------------------------------------------------------------------------

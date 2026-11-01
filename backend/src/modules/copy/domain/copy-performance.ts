@@ -1,6 +1,7 @@
 import { Prisma } from '@prisma/client';
 
 import { roundMoney } from '../../simulation/engine/simulation-engine';
+import { planOrder, type BookPosition } from '../../trading/domain/position-book';
 
 /**
  * MODULE 07 - the copy ledger, replayed.
@@ -14,22 +15,20 @@ import { roundMoney } from '../../simulation/engine/simulation-engine';
  *
  * SO THE EVENT TABLE IS REPLAYED. Every copy event is a COPIED or REJECTED row
  * carrying the exact quantity and price the follower executed, and the
- * engine's accounting is deterministic: average-cost, one position per
+ * engine's accounting is deterministic: average-cost, a net position per
  * (follow, symbol), a position deleted the moment it empties. Replaying the
  * events in the order the engine consumed them therefore reproduces the
  * engine's own arithmetic.
  *
- * THE REPLAY MIRRORS THE ENGINE LINE FOR LINE, ON PURPOSE. `CopyExecutionService`
- * writes the position on a BUY as `roundMoney(qty + q) x roundMoney((q*avg +
- * qty*price) / (q + qty))` and, on a SELL, realises `roundMoney(qty*price -
- * qty*avg)` before reducing the quantity. This module does the same
- * arithmetic, in the same order, with the same rounding - not an equivalent
- * formula, the same one. A second implementation that merely agreed "on
- * average" could disagree with the ledger on a single fill, and the screen
- * would then show a profit and loss the database does not hold.
+ * THE REPLAY CALLS THE ENGINE'S OWN ARITHMETIC. `CopyExecutionService` asks the
+ * shared kernel in Module `trading` what an order does to the book, and this
+ * replay asks the same kernel the same question. A second implementation that
+ * merely agreed "on average" could disagree with the ledger on a single fill,
+ * and the screen would then show a profit and loss the database does not hold -
+ * so there is no second implementation.
  *
  * THE RECONCILIATION IS THE POINT. `copy_accounts.realized_pnl` is written by
- * the engine as the sum of exactly these per-SELL realisations. The replayed
+ * the engine as the sum of exactly these per-fill realisations. The replayed
  * total must equal the stored total, and the service that reads both logs a
  * warning when they do not, because a divergence is a bug in one of the two -
  * never something to paper over with a rounding tolerance.
@@ -47,7 +46,7 @@ export interface CopyLedgerEvent {
   readonly followerId: string;
   readonly strategyId: string;
   readonly symbol: string;
-  readonly side: 'BUY' | 'SELL';
+  readonly side: 'LONG' | 'SHORT';
   /** The quantity the follower executed. Null for a refusal. */
   readonly quantity: Prisma.Decimal | null;
   /** The price the follower executed at. Null for a refusal. */
@@ -67,13 +66,13 @@ export interface CopyLedgerEvent {
 export interface PerformancePoint {
   readonly strategyId: string;
   readonly symbol: string;
-  readonly side: 'BUY' | 'SELL';
+  readonly side: 'LONG' | 'SHORT';
   readonly quantity: Prisma.Decimal;
   readonly fillPrice: Prisma.Decimal;
   readonly gross: Prisma.Decimal;
   /**
-   * The P&L this single fill realised. Zero for a BUY - a BUY moves cash into
-   * a position and realises nothing - and zero for a refusal.
+   * The P&L this single fill realised. Zero for a fill that opened or added to
+   * a position - those move cash and realise nothing - and zero for a refusal.
    */
   readonly realizedPnl: Prisma.Decimal;
   /** The running total across every fill, in consumption order. */
@@ -87,12 +86,6 @@ export interface CopyPerformance {
   readonly realizedPnl: Prisma.Decimal;
   readonly copiedCount: number;
   readonly rejectedCount: number;
-}
-
-/** The engine's own position state for one (follow, symbol). */
-interface PositionState {
-  quantity: Prisma.Decimal;
-  averageEntryPrice: Prisma.Decimal;
 }
 
 /**
@@ -114,7 +107,7 @@ export function compareLedgerEvents(left: CopyLedgerEvent, right: CopyLedgerEven
  */
 export function replayCopyLedger(events: readonly CopyLedgerEvent[]): CopyPerformance {
   const ordered = [...events].sort(compareLedgerEvents);
-  const positions = new Map<string, PositionState>();
+  const positions = new Map<string, BookPosition>();
   const points: PerformancePoint[] = [];
 
   let cumulative = ZERO;
@@ -140,50 +133,20 @@ export function replayCopyLedger(events: readonly CopyLedgerEvent[]): CopyPerfor
     copiedCount += 1;
 
     const key = `${event.followerId}|${event.strategyId}|${event.symbol}`;
-    const position = positions.get(key);
-    let realized = ZERO;
+    const plan = planOrder({
+      side: event.side,
+      quantity,
+      fillPrice,
+      position: positions.get(key) ?? null,
+    });
 
-    if (event.side === 'BUY') {
-      if (position === undefined) {
-        // The engine creates the position with the raw fill price, not a
-        // recomputed average - there is no history to average against.
-        positions.set(key, { quantity, averageEntryPrice: fillPrice });
-      } else {
-        const newQuantity = position.quantity.plus(quantity);
-        const newAverage = position.quantity
-          .times(position.averageEntryPrice)
-          .plus(quantity.times(fillPrice))
-          .dividedBy(newQuantity);
-
-        positions.set(key, {
-          quantity: roundMoney(newQuantity),
-          averageEntryPrice: roundMoney(newAverage),
-        });
-      }
+    if (plan.position === null) {
+      positions.delete(key);
     } else {
-      // The engine's SELL path reads the position defensively: a missing
-      // position means a zero holding and a zero entry price. That branch is
-      // unreachable - the sizing rule caps a SELL at the quantity held and
-      // refuses it outright when nothing is held - but the replay mirrors it
-      // anyway, because a replay that disagreed with the engine in even an
-      // unreachable branch would be a replay that could disagree in a
-      // reachable one.
-      const held = position?.quantity ?? ZERO;
-      const entryPrice = position?.averageEntryPrice ?? ZERO;
-
-      realized = roundMoney(quantity.times(fillPrice).minus(quantity.times(entryPrice)));
-
-      const remainder = held.minus(quantity);
-      if (remainder.lte(0)) {
-        // An emptied position is deleted by the engine, so the next BUY starts
-        // a fresh average rather than averaging against a closed lot.
-        positions.delete(key);
-      } else if (position !== undefined) {
-        positions.set(key, { quantity: roundMoney(remainder), averageEntryPrice: position.averageEntryPrice });
-      }
+      positions.set(key, plan.position);
     }
 
-    cumulative = cumulative.plus(realized);
+    cumulative = cumulative.plus(plan.realizedPnl);
 
     points.push({
       strategyId: event.strategyId,
@@ -192,7 +155,7 @@ export function replayCopyLedger(events: readonly CopyLedgerEvent[]): CopyPerfor
       quantity,
       fillPrice,
       gross: event.gross ?? roundMoney(quantity.times(fillPrice)),
-      realizedPnl: realized,
+      realizedPnl: plan.realizedPnl,
       cumulativePnl: cumulative,
       processedAt: event.processedAt,
     });

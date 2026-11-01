@@ -9,6 +9,7 @@ import {
   Compass,
   Eye,
   EyeOff,
+  Flame,
   Layers,
   LineChart,
   Loader2,
@@ -20,6 +21,7 @@ import {
 } from "lucide-react";
 
 import AppShell from "@/components/AppShell";
+import { ExpertChatModal } from "@/components/ExpertChatModal";
 import { useRoles } from "@/components/RoleProvider";
 import {
   ApiError,
@@ -129,7 +131,7 @@ export default function StrategiesPage() {
   const [page, setPage] = useState(1);
   const [statusFilter, setStatusFilter] = useState<StrategyStatusName | "ALL">("ALL");
   const [editingId, setEditingId] = useState<string | null>(null);
-
+  const [chatTarget, setChatTarget] = useState<{ id: string; name: string } | null>(null);
   const [draft, setDraft] = useState<StrategyDraft>({
     name: "",
     description: "",
@@ -483,6 +485,16 @@ export default function StrategiesPage() {
             error={discoverError}
             onRetry={refresh}
             onPage={goToPage}
+            onChat={(s) => setChatTarget({ id: s.id, name: s.name })}
+          />
+        )}
+
+        {chatTarget && (
+          <ExpertChatModal
+            strategyId={chatTarget.id}
+            strategyName={chatTarget.name}
+            isOpen={chatTarget !== null}
+            onClose={() => setChatTarget(null)}
           />
         )}
       </div>
@@ -905,12 +917,14 @@ function DiscoverPanel({
   error,
   onRetry,
   onPage,
+  onChat,
 }: {
   page: PublicStrategyPage | null;
   status: LoadStatus;
   error: string | null;
   onRetry: () => void;
   onPage: (page: number) => void;
+  onChat?: (strategy: { id: string; name: string }) => void;
 }) {
   return (
     <div className="bg-[#12161E] border border-[#202735] rounded-xl p-5">
@@ -974,13 +988,24 @@ function DiscoverPanel({
                 NO RETURNS, RISK FIGURES OR OWNER IDENTITY IN THIS RESPONSE.
               </p>
 
-              <Link
-                href={`/strategies/${strategy.id}`}
-                className="flex items-center justify-center gap-1.5 w-full px-3 py-1.5 rounded-lg bg-[#161B24] hover:bg-[#202735] border border-[#273242] text-[11px] font-bold text-[#A6B2C4] hover:text-white transition-colors"
-              >
-                <LineChart className="w-3.5 h-3.5" />
-                <span>Open chart</span>
-              </Link>
+              <div className="grid grid-cols-2 gap-2 pt-1">
+                <Link
+                  href={`/strategies/${strategy.id}`}
+                  className="flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#161B24] hover:bg-[#202735] border border-[#273242] text-[11px] font-bold text-[#A6B2C4] hover:text-white transition-colors"
+                >
+                  <LineChart className="w-3.5 h-3.5" />
+                  <span>Open chart</span>
+                </Link>
+                <button
+                  type="button"
+                  onClick={() => onChat?.({ id: strategy.id, name: strategy.name })}
+                  className="flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#FF5A1F]/15 hover:bg-[#FF5A1F]/25 border border-[#FF5A1F]/40 text-[11px] font-bold text-[#FF5A1F] transition-colors shadow-sm"
+                  title="Direct 1-on-1 consultation (10 EMBER)"
+                >
+                  <Flame className="w-3.5 h-3.5 text-[#FF5A1F]" />
+                  <span>Chat (10 EMBER)</span>
+                </button>
+              </div>
             </div>
           ))}
         </div>

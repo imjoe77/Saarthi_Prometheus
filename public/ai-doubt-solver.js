@@ -157,19 +157,22 @@
     match(query, explicitElement) {
       if (explicitElement) {
         var matchFound = this.extractor.cachedElements.find(c => c.element === explicitElement);
+        var aiHolder = explicitElement.closest ? explicitElement.closest('[data-ai-id]') : null;
         // What the user pointed at may be too small to be in the scan cache.
         // Describe it on the spot so the model still receives its context.
         if (!matchFound) {
           var pointedText = (explicitElement.innerText || explicitElement.textContent || '').trim();
           matchFound = {
-            id: explicitElement.dataset ? explicitElement.dataset.aiId : undefined,
-            element: explicitElement,
+            id: (explicitElement.dataset && explicitElement.dataset.aiId) || (aiHolder && aiHolder.dataset ? aiHolder.dataset.aiId : undefined),
+            element: aiHolder || explicitElement,
             tag: explicitElement.tagName ? explicitElement.tagName.toLowerCase() : 'element',
             type: 'element',
             title: (explicitElement.getAttribute('aria-label') || explicitElement.getAttribute('title') || pointedText.split('\n')[0] || '').slice(0, 60) || 'Selected element',
             text: pointedText.slice(0, 300),
             role: explicitElement.getAttribute('role') || 'element'
           };
+        } else if (!matchFound.id && aiHolder && aiHolder.dataset && aiHolder.dataset.aiId) {
+          matchFound.id = aiHolder.dataset.aiId;
         }
         return { exactMatch: matchFound, candidates: [matchFound], confidence: 1.0 };
       }
@@ -250,15 +253,115 @@
       // Configuration can be injected via window.PROMETHEUS_AI_CONFIG
       this.config = Object.assign({
         apiEndpoint: 'http://localhost:3001/api/ai-doubt-solver',
+        copyEndpoint: null,
         modelName: 'configured backend'
       }, window.PROMETHEUS_AI_CONFIG || {});
     }
 
+    /**
+     * The page's own idea of what is in view.
+     *
+     * A page that shows a trade publishes it as `window.PROMETHEUS_PAGE_CONTEXT`.
+     * The widget reads nothing but a pointer out of it - never a price, never a
+     * quantity - so the answer still comes from the ledger on the server.
+     */
+    getPublishedContext() {
+      var published = window.PROMETHEUS_PAGE_CONTEXT;
+      if (!published || typeof published !== 'object') return null;
+      return published;
+    }
+
+    /**
+     * The digest of the page, merged with whatever the page published about
+     * itself.
+     *
+     * Always sent, even when no element was clicked: a question about the page
+     * ("why is this short?") is still a question about the page, and the
+     * reader did not have to point at anything to ask it.
+     */
+    getPageContext() {
+      var app = window.PrometheusAIApp;
+      var summary = app && app.extractor ? app.extractor.getVisibleContextSummary() : null;
+      var published = this.getPublishedContext();
+      if (!published) return summary;
+      var merged = Object.assign({}, summary || {});
+      if (published.page) merged.page = published.page;
+      if (published.symbol) merged.symbol = published.symbol;
+      if (published.focusId) merged.focusId = published.focusId;
+      return merged;
+    }
+
+    /**
+     * The pointer to the trade in question: the row the reader inspected, or
+     * the market the page published.
+     */
+    getPointer(elementContext, pageContext) {
+      var pointer = { symbol: null, focusId: null };
+      var id = elementContext && elementContext.id ? String(elementContext.id) : '';
+
+      if (id.indexOf('copy-event:') === 0) {
+        pointer.focusId = id;
+        return pointer;
+      }
+      if (id.indexOf('copy-position:') === 0) {
+        pointer.symbol = id.slice('copy-position:'.length).split(':')[0] || null;
+        return pointer;
+      }
+      if (pageContext) {
+        if (pageContext.focusId) pointer.focusId = pageContext.focusId;
+        if (pageContext.symbol) pointer.symbol = pageContext.symbol;
+      }
+      return pointer;
+    }
+
+    /**
+     * Asks the ledger about the reader's own copy trades.
+     *
+     * Returns null whenever the ledger cannot answer - no session, nothing in
+     * the book, the route unreachable - so the caller falls back to the
+     * general knowledge base. A ledger answer is preferred because it is about
+     * THIS book: the fill that happened, the size it produced, the reason it
+     * was refused.
+     */
+    async askCopyLedger(query, elementContext, pageContext) {
+      if (!this.config.copyEndpoint) return null;
+      var pointer = this.getPointer(elementContext, pageContext);
+
+      try {
+        var response = await fetch(this.config.copyEndpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: window.AbortSignal && typeof window.AbortSignal.timeout === 'function' ? window.AbortSignal.timeout(20000) : undefined,
+          body: JSON.stringify({
+            query: query,
+            symbol: pointer.symbol,
+            focusId: pointer.focusId
+          })
+        });
+        if (!response.ok) return null;
+        var data = await response.json().catch(function () { return null; });
+        if (!data || typeof data.concept !== 'string' || !data.sections) return null;
+        data.source = 'ledger';
+        return data;
+      } catch (error) {
+        // The ledger is an extra source, never a dependency: if it cannot be
+        // reached, the general answer is still an answer.
+        return null;
+      }
+    }
+
     async resolveDoubt(query, elementContext, conversationHistory) {
+      if (!this.config.apiEndpoint && !this.config.copyEndpoint) {
+        throw new Error('AI is not connected yet. Configure the Prometheus AI backend to get an AI-generated explanation.');
+      }
+      var pageContext = this.getPageContext();
+
+      var fromLedger = await this.askCopyLedger(query, elementContext, pageContext);
+      if (fromLedger) return this.normalise(fromLedger);
+
       if (!this.config.apiEndpoint) {
         throw new Error('AI is not connected yet. Configure the Prometheus AI backend to get an AI-generated explanation.');
       }
-      var pageContext = window.PrometheusAIApp.extractor.getVisibleContextSummary();
       var response = await fetch(this.config.apiEndpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -279,6 +382,15 @@
       var data = await response.json().catch(function () { return {}; });
       if (!response.ok) throw new Error(data.error || 'The AI service could not answer just now. Please try again.');
       if (!data || typeof data.concept !== 'string' || !data.sections || typeof data.sections.simple !== 'string') {
+        throw new Error('The AI service returned an incomplete answer. Please try again.');
+      }
+      data.source = 'general';
+      return this.normalise(data);
+    }
+
+    /** Puts an answer inside the widget's own limits. */
+    normalise(data) {
+      if (!data.sections || typeof data.sections.simple !== 'string') {
         throw new Error('The AI service returned an incomplete answer. Please try again.');
       }
       ['what', 'simple', 'howItWorks', 'example', 'remember'].forEach(function (key) {
@@ -449,6 +561,9 @@
           <span class="ai-popup-tag">
             <svg viewBox="0 0 24 24"><path d="M12 2L15 8L21 9L17 14L18 20L12 17L6 20L7 14L3 9L9 8L12 2Z"/></svg>
             <span class="ai-popup-concept-tag">WHAT YOU'RE LOOKING AT</span>
+          </span>
+          <span class="ai-popup-ember-tag" title="Illustrative: 1 EMBER per consultation">
+            <span class="ai-ember-flame">🔥</span> <span id="aiPopupEmberBal">100</span> EMBER
           </span>
           <button class="ai-popup-close" type="button" aria-label="Close Explanation">×</button>
         </div>
@@ -629,6 +744,17 @@
       this.lastAnswer = null;
       this.conversationHistory = [];
       this.isSuggestionsMinimized = false;
+      this.isSpeechExpanded = false;
+
+      // --- EMBER economy (illustrative) ---
+      // Each answered question costs 1 EMBER.  The balance starts at 100 and
+      // is stored in sessionStorage so it persists across page navigations
+      // within the same browser session but resets on every fresh visit.
+      var _savedEmber = null;
+      try { _savedEmber = window.sessionStorage.getItem('pyrusEmberBalance'); } catch (_) {}
+      this.emberBalance = (_savedEmber !== null && !isNaN(Number(_savedEmber)))
+        ? Number(_savedEmber)
+        : 100;
 
       // Where he is looking. Written to CSS custom properties on the scene so the
       // pose and the light inside him both follow.
@@ -693,7 +819,17 @@
         </div>
 
         <div class="ai-pyrus-speech" id="aiPyrusSpeech">
-          <div class="ai-speech-echo" id="aiSpeechEcho" hidden></div>
+          <div class="ai-speech-topbar">
+            <div class="ai-speech-echo" id="aiSpeechEcho" hidden></div>
+            <button class="ai-speech-expand-btn" id="aiSpeechExpandBtn" type="button" aria-label="Expand answer view" title="Expand answer view">
+              <svg viewBox="0 0 24 24" class="ai-icon-expand" aria-hidden="true">
+                <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <svg viewBox="0 0 24 24" class="ai-icon-collapse" aria-hidden="true">
+                <path d="M4 14h6v6M20 10h-6V4M10 14l-7 7M14 10l7-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+          </div>
           <div class="ai-speech-body">
             <span class="ai-speech-dots" id="aiSpeechDots" hidden><i></i><i></i><i></i></span>
             <span class="ai-speech-text" id="aiSpeechText" aria-live="polite">Hi — I’m Pyrus, your guide on this page. Ask me anything, or point me at something.</span>
@@ -724,6 +860,10 @@
           <span class="ai-pyrus-gaze" id="aiPyrusGaze" aria-hidden="true"></span>
         </div>
 
+        <div class="ai-speech-ember-bar" id="aiSpeechEmberBar" title="Illustrative: 1 EMBER per Pyrus question">
+          🔥 <span id="aiSpeechEmberBal">100</span> EMBER
+        </div>
+
         <div class="ai-pyrus-nameplate">
           <span class="ai-pyrus-name">Pyrus</span>
           <span class="ai-pyrus-status" id="aiPyrusStatus" data-state="checking" title="Checking the Prometheus AI service…">connecting</span>
@@ -735,12 +875,18 @@
       this.speechEl = this.scene.querySelector('#aiPyrusSpeech');
       this.speechTextEl = this.scene.querySelector('#aiSpeechText');
       this.speechEchoEl = this.scene.querySelector('#aiSpeechEcho');
+      this.speechExpandBtn = this.scene.querySelector('#aiSpeechExpandBtn');
       this.speechRepliesEl = this.scene.querySelector('#aiSpeechReplies');
       this.repliesHeaderEl = this.scene.querySelector('#aiRepliesHeader');
       this.repliesToggleBtn = this.scene.querySelector('#aiRepliesToggle');
       this.speechDotsEl = this.scene.querySelector('#aiSpeechDots');
       this.askField = this.scene.querySelector('#aiAskField');
       this.askSendBtn = this.scene.querySelector('#aiAskSend');
+      this.speechEmberBarEl = this.scene.querySelector('#aiSpeechEmberBar');
+      this.speechEmberBalEl = this.scene.querySelector('#aiSpeechEmberBal');
+
+      // Sync initial display
+      this.refreshEmberDisplay();
 
       // The gaze light is masked by Pyrus's own artwork, so it can only ever
       // appear inside his silhouette. The mask URL has to be resolved here,
@@ -761,6 +907,10 @@
       // turns to follow you is company.
       document.addEventListener('pointermove', (e) => this.trackPointer(e), { passive: true });
 
+      if (this.speechExpandBtn) {
+        this.speechExpandBtn.addEventListener('click', () => this.toggleSpeechExpand());
+      }
+
       if (this.repliesToggleBtn) {
         this.repliesToggleBtn.addEventListener('click', () => this.toggleSuggestions());
       }
@@ -777,7 +927,8 @@
       // Global keyboard accessibility
       document.addEventListener('keydown', (e) => {
         if (e.key !== 'Escape') return;
-        if (this.isInspectMode) this.toggleInspectMode(false);
+        if (this.isSpeechExpanded) this.toggleSpeechExpand(false);
+        else if (this.isInspectMode) this.toggleInspectMode(false);
         else if (this.popup.popupEl.classList.contains('open')) this.dismissPopup();
         else if (this.isSummoned) this.dismissPyrus();
       });
@@ -792,9 +943,30 @@
       } catch (_) { /* storage blocked — stay silent */ }
     }
 
+    toggleSpeechExpand(override) {
+      this.isSpeechExpanded = (override !== undefined) ? override : !this.isSpeechExpanded;
+      if (this.speechEl) {
+        if (this.isSpeechExpanded) {
+          this.speechEl.classList.add('is-expanded');
+          if (this.speechExpandBtn) this.speechExpandBtn.setAttribute('title', 'Collapse answer view');
+        } else {
+          this.speechEl.classList.remove('is-expanded');
+          if (this.speechExpandBtn) this.speechExpandBtn.setAttribute('title', 'Expand answer view');
+        }
+      }
+    }
+
     /* Openers are drawn from the page itself, so they always refer to something
        the user can actually see. */
     openingReplies() {
+      var published = this.aiService ? this.aiService.getPublishedContext() : null;
+      if (published && published.page === 'copy-trading') {
+        return [
+          'Why was it short at this point?',
+          'Why did it sell here?',
+          'Why was that trade rejected?'
+        ];
+      }
       var headings = Array.from(document.querySelectorAll('h1, h2, h3'))
         .filter(function (el) { return el.getClientRects().length && !el.closest('.ai-pyrus-scene, .ai-doubt-popup'); })
         .map(function (el) { return (el.innerText || '').trim().replace(/\s+/g, ' '); })
@@ -813,14 +985,20 @@
     }
 
     followUpReplies(concept) {
-      return [
-        'Explain ' + concept + ' more simply',
-        'Give me an example of ' + concept,
-        { label: 'Show me the full breakdown', detail: true }
-      ];
+      var replies = [];
+      if (this.lastAnswer && this.lastAnswer.data && this.lastAnswer.data.source === 'ledger') {
+        replies.push('Why was my size different from the expert?');
+        replies.push('Why was it short at this point?');
+      } else {
+        replies.push('Explain ' + concept + ' more simply');
+        replies.push('Give me an example of ' + concept);
+      }
+      replies.push({ label: this.isSpeechExpanded ? 'Contract bubble' : 'Expand answer bubble', expand: true });
+      replies.push({ label: 'Show me the full breakdown', detail: true });
+      return replies;
     }
 
-    // Replies are plain strings, or {label, query, element, detail} objects.
+    // Replies are plain strings, or {label, query, element, detail, expand} objects.
     showQuickReplies(replies) {
       var host = this.speechRepliesEl;
       if (!host) return;
@@ -830,7 +1008,7 @@
       if (this.repliesHeaderEl) this.repliesHeaderEl.hidden = !hasReplies;
 
       var self = this;
-      (replies || []).slice(0, 3).forEach(function (reply) {
+      (replies || []).slice(0, 4).forEach(function (reply) {
         var isObject = typeof reply === 'object' && reply !== null;
         var button = document.createElement('button');
         button.type = 'button';
@@ -838,6 +1016,7 @@
         button.textContent = isObject ? reply.label : reply;
         button.addEventListener('click', function () {
           if (isObject && reply.detail) { self.showDetail(); return; }
+          if (isObject && reply.expand) { self.toggleSpeechExpand(); return; }
           self.handleUserQuestion(isObject ? (reply.query || reply.label) : reply, isObject ? reply.element : null);
         });
         host.appendChild(button);
@@ -901,6 +1080,7 @@
       this.scene.style.bottom = '';
       this.setMood('idle');
       this.releaseGaze();
+      if (this.isSpeechExpanded) this.toggleSpeechExpand(false);
       this.visualManager.clearHighlight();
       this.fabBtn.setAttribute('aria-expanded', 'false');
       this.fabBtn.focus();
@@ -983,18 +1163,75 @@
       this.handleUserQuestion(query, targetElement);
     }
 
+    isUnrelatedQuery(query, explicitElement) {
+      if (explicitElement) return false;
+      var q = (query || '').toLowerCase().trim();
+      if (!q) return false;
+
+      // Common greetings & assistant identity questions are permitted
+      if (/^(hi|hello|hey|greetings|help|who are you|what can you do|what are you)\b/i.test(q)) return false;
+
+      // Trading, crypto, and Prometheus platform terms
+      var tradingKeywords = /\b(trade|trading|trader|crypto|bitcoin|btc|eth|sol|usdt|inr|token|ember|order|long|short|pnl|profit|loss|wallet|liquidity|pool|apr|apy|staking|stake|chart|candle|candlestick|sentinel|alert|risk|drawdown|sharpe|margin|leverage|entry|exit|buy|sell|bought|sold|copy|follower|strategy|allocation|fill|reject|refus|slippage|market|balance|deposit|withdraw|portfolio|commission|fee|price|quote|volatility|breakout|stop.?loss|take.?profit|pyrus|prometheus|platform|desk|kpi|metric|row|pot|invest|currency|position|positions)\b/i;
+
+      if (tradingKeywords.test(q)) return false;
+
+      // Check if query matches headings/labels on the live page
+      var headings = Array.from(document.querySelectorAll('h1, h2, h3, h4, th, .metric-box, .stat-card'))
+        .map(function (el) { return (el.innerText || '').toLowerCase(); });
+      var matchesPage = headings.some(function (h) { return h && h.length > 2 && q.includes(h); });
+      if (matchesPage) return false;
+
+      // Obvious non-financial / non-platform topics
+      var unrelatedPatterns = /\b(joke|recipe|cook|food|song|sing|movie|actor|film|cinema|cricket|football|soccer|basketball|nfl|tennis|capital of|poem|lyrics|code for|python|javascript code|java code|write code|homework|translate|dating|love|relationship|weather|forecast|prime minister|president|who won|who is elon|who is messi|who is ronaldo|celebrity|music|guitar|game|gaming|car|cars|flight|hotel|vacation)\b/i;
+      if (unrelatedPatterns.test(q)) return true;
+
+      // Open-ended general trivia with no trading connection
+      var generalTrivia = /^(who is|who was|who wrote|what is the capital|where is|when was|how to make|how to cook|tell me about|tell a|sing a|write a)\b/i;
+      if (generalTrivia.test(q)) return true;
+
+      return false;
+    }
+
     async handleUserQuestion(query, explicitElement) {
       if (this.isBusy) return;
       this.isBusy = true;
       if (!this.isSummoned) this.summonPyrus('quiet');
 
       this.echoQuestion(query);
+
+      // Refuse unrelated non-trading/non-platform questions politely
+      if (this.isUnrelatedQuery(query, explicitElement)) {
+        this.setMood('speaking');
+        this.showQuickReplies([]);
+        await this.speak(
+          'I’m Pyrus, your Prometheus trading buddy! I am dedicated solely to trading, copy strategies, markets, and the Prometheus platform. Please ask me about a trade, metric, chart, or concept on your screen!'
+        );
+        this.showQuickReplies(this.openingReplies());
+        this.finishTurn();
+        return;
+      }
+
       this.think('Reading the page…');
       this.askSendBtn.disabled = true;
 
       // Match the doubt to an exact element in the live DOM
       var isFollowUp = /\b(simpler|more simply|another example|give me an example|tell me more|follow.?up|shorter|fewer words|step by step|that answer|your answer)\b/i.test(query);
-      var matchResult = this.matcher.match(query, explicitElement || (isFollowUp ? this.currentContextElement : null));
+  var matchResult = this.matcher.match(
+  query,
+  explicitElement || (isFollowUp ? this.currentContextElement : null)
+);
+
+var isGeneralQuestion =
+  /^(who is|what is|what are|when did|when was|where is|where was|why does|why is|how does|how do|define|explain)\b/i.test(query.trim());
+
+if (isGeneralQuestion && !explicitElement && !isFollowUp) {
+  matchResult = {
+    exactMatch: null,
+    candidates: [],
+    confidence: 0
+  };
+}
 
       // Ambiguity: Pyrus asks instead of guessing.
       if (matchResult.isAmbiguous && matchResult.candidates.length > 1) {
@@ -1012,8 +1249,23 @@
       var targetElement = targetItem ? targetItem.element : (explicitElement || null);
 
       // Pronouns without a selected or confidently matched target must not cause a guess.
-      if (!targetElement && !targetItem && /\b(this|that|it|here|part|thing|button)\b/i.test(query) &&
-          !/\b(what is|define|meaning of|difference between|explain\s+(apr|pnl|sharpe|impermanent loss|drawdown|copy trading))\b/i.test(query)) {
+      var ambiguousSubject =
+        !targetElement && !targetItem &&
+        /\b(this|that|it|here|part|thing|button)\b/i.test(query) &&
+        !/\b(what is|define|meaning of|difference between|explain\s+(apr|pnl|sharpe|impermanent loss|drawdown|copy trading))\b/i.test(query);
+
+      // A page that publishes what is in view has already answered "which
+      // part", so the question goes to the ledger before it is refused. The
+      // ledger is the only source that can answer "why was it short at this
+      // point" - it knows the reader's own book, and the general model does
+      // not. Only a ledger that cannot answer leaves the reader without a
+      // subject to point at.
+      var ledgerAnswer = null;
+      if (ambiguousSubject) {
+        ledgerAnswer = await this.aiService.askCopyLedger(query, targetItem, this.aiService.getPageContext());
+      }
+
+      if (ambiguousSubject && ledgerAnswer === null) {
         this.setMood('speaking');
         this.showQuickReplies([]);
         await this.speak('Which part do you mean? Say its name, or use the pointer and show me on the page.');
@@ -1031,10 +1283,13 @@
 
       // Resolve the doubt through the AI service, then say it out loud.
       try {
-        var aiResponse = await this.aiService.resolveDoubt(query, targetItem, this.conversationHistory);
+        var aiResponse = ledgerAnswer || await this.aiService.resolveDoubt(query, targetItem, this.conversationHistory);
         this.conversationHistory.push({ role: 'user', content: query });
         this.conversationHistory.push({ role: 'assistant', content: aiResponse.sections.simple, target: aiResponse.concept });
         this.lastAnswer = { data: aiResponse, element: targetElement };
+
+        // Deduct 1 EMBER per answered question (illustrative)
+        this.spendEmber(1);
 
         // Point at the thing being explained, with the laser beam coming out of
         // the speech cloud.
@@ -1042,7 +1297,16 @@
 
         this.setMood('speaking');
         this.showQuickReplies([]);
-        await this.speak(aiResponse.sections.simple || aiResponse.sections.what || 'Here is what I found.');
+        // A ledger answer covers the trade facts, why the copy mirrored it, and how
+        // the directional mechanics work, so a naive trader gets the full explanation.
+        var spoken;
+        if (aiResponse.source === 'ledger') {
+          var sec = aiResponse.sections || {};
+          spoken = [sec.what, sec.simple, sec.howItWorks].filter(Boolean).join('\n\n');
+        } else {
+          spoken = (aiResponse.sections && aiResponse.sections.simple) || (aiResponse.sections && aiResponse.sections.what);
+        }
+        await this.speak(spoken || 'Here is what I found.');
         this.showQuickReplies(this.followUpReplies(aiResponse.concept));
       } catch (error) {
         var notice = error && error.message ? error.message : 'Something went wrong on my side. Please try that again.';
@@ -1063,6 +1327,45 @@
       this.speechDotsEl.hidden = true;
       this.askSendBtn.disabled = false;
       this.isBusy = false;
+    }
+
+    // --- EMBER economy helpers ---
+
+    /** Deduct `amount` EMBER from the running balance and refresh all displays. */
+    spendEmber(amount) {
+      this.emberBalance = Math.max(0, this.emberBalance - amount);
+      try { window.sessionStorage.setItem('pyrusEmberBalance', String(this.emberBalance)); } catch (_) {}
+      this.refreshEmberDisplay();
+    }
+
+    /**
+     * Update every EMBER indicator on the page:
+     *  • the bar at the bottom of Pyrus's speech cloud
+     *  • the pill in the detail card header (#aiPopupEmberBal)
+     *  • any externally-rendered indicator (#aiSpeechEmberBal duplicate guard)
+     */
+    refreshEmberDisplay() {
+      var bal = this.emberBalance;
+      var balStr = bal.toFixed(0);
+      var isLow = bal <= 20;
+
+      // Speech cloud bar
+      if (this.speechEmberBalEl) this.speechEmberBalEl.textContent = balStr;
+      if (this.speechEmberBarEl) {
+        this.speechEmberBarEl.classList.toggle('ember-low', isLow);
+      }
+
+      // Detail card popup pill
+      var popupBal = document.getElementById('aiPopupEmberBal');
+      if (popupBal) popupBal.textContent = balStr;
+      var popupTag = popupBal ? popupBal.closest('.ai-popup-ember-tag') : null;
+      if (popupTag) {
+        popupTag.classList.toggle('ember-low', isLow);
+        // Brief flash animation to acknowledge the spend
+        popupTag.classList.remove('ember-spent');
+        void popupTag.offsetWidth; // reflow
+        popupTag.classList.add('ember-spent');
+      }
     }
 
     // --- Pyrus's voice ---------------------------------------------------------

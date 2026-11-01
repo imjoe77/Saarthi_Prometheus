@@ -40,7 +40,7 @@ export interface ExpertTrade {
   /** When the expert's fill committed. */
   at: string;
   symbol: string;
-  side: "BUY" | "SELL";
+  side: "LONG" | "SHORT";
   /** The price the fill executed at. */
   price: number;
   /** The quantity that was executed. */
@@ -72,7 +72,7 @@ import { COPY_SYMBOL_COLOURS } from "@/lib/design/copyPalette";
 interface MergedTrade {
   time: UTCTimestamp;
   price: number;
-  side: "BUY" | "SELL";
+  side: "LONG" | "SHORT";
   quantity: number;
   fills: number;
 }
@@ -118,23 +118,23 @@ function mergeTrades(trades: ExpertTrade[]): MergedTrade[] {
 }
 
 function markerFor(merge: MergedTrade): SeriesMarker<UTCTimestamp> {
-  const isBuy = merge.side === "BUY";
+  const isLong = merge.side === "LONG";
   const amount = merge.quantity.toLocaleString(undefined, { maximumFractionDigits: 8 });
 
   return {
     time: merge.time,
-    position: isBuy ? "belowBar" : "aboveBar",
-    color: isBuy ? GAIN : LOSS,
-    shape: isBuy ? "arrowUp" : "arrowDown",
+    position: isLong ? "belowBar" : "aboveBar",
+    color: isLong ? GAIN : LOSS,
+    shape: isLong ? "arrowUp" : "arrowDown",
     text:
-      `${isBuy ? "BUY" : "SELL"} ${amount}` +
+      `${isLong ? "LONG" : "SHORT"} ${amount}` +
       (merge.fills > 1 ? ` (${merge.fills} fills)` : ""),
   };
 }
 
 /**
  * The expert's trades: one price path per instrument, with a marker on every
- * buy and every sell.
+ * long and every short.
  */
 export function ExpertTradesChart({ trades, height = 300 }: { trades: ExpertTrade[]; height?: number }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -247,10 +247,10 @@ export function ExpertTradesChart({ trades, height = 300 }: { trades: ExpertTrad
  * The copy book's realised profit and loss over time.
  *
  * Every point is a consumed fill, and the value on it is the running total
- * after that fill. A buy realises nothing, so it lands on the same value as
- * the fill before it: the line stays flat across it rather than stepping, and
- * the flatness is the honest reading - the money moved from cash into a
- * position, it did not appear or vanish.
+ * after that fill. A fill that only opens a position realises nothing, so it
+ * lands on the same value as the fill before it: the line stays flat across it
+ * rather than stepping, and the flatness is the honest reading - the money
+ * moved from cash into a position, it did not appear or vanish.
  */
 export function CopyPnlChart({ points, height = 220 }: { points: PnlPoint[]; height?: number }) {
   const containerRef = useRef<HTMLDivElement | null>(null);

@@ -8,10 +8,20 @@ import { matchKnowledgeEntry } from './knowledge-base';
 /** Mirrors the widget's own caps so a verbose model cannot overflow its panel. */
 const CONCEPT_MAX = 120;
 const SECTION_MAX = 1800;
-/** The widget aborts its fetch at 30s; the model must fail before that. */
-const MODEL_TIMEOUT_MS = 20_000;
 /** Context is a scoring hint, not a document — bound it before matching. */
 const CONTEXT_MAX = 4_000;
+
+/**
+ * The longest the model may hold a request, whatever the configuration allows.
+ *
+ * The BFF proxy waits 25s for this route and the widget abandons its own
+ * request at 30s. A model attempt that runs past that leaves no room for the
+ * knowledge-base answer waiting behind it, so the visitor would see a
+ * timeout instead of an answer. The configured timeout is therefore a
+ * ceiling, not a target: the model gets what is left of the budget, and the
+ * glossary answers the moment it is gone.
+ */
+const MAX_MODEL_ATTEMPT_MS = 12_000;
 
 /**
  * Answers trade-buddy questions (design-integration task).
@@ -85,7 +95,7 @@ export class AiDoubtSolverService {
         pageContext: dto.pageContext ?? null,
         history: (dto.history ?? []).slice(-8),
       }),
-      signal: AbortSignal.timeout(MODEL_TIMEOUT_MS),
+      signal: AbortSignal.timeout(Math.min(this.config.aiModelTimeoutMs, MAX_MODEL_ATTEMPT_MS)),
       cache: 'no-store',
     });
 

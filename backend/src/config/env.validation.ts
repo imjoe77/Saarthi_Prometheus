@@ -417,6 +417,29 @@ export const envValidationSchema = Joi.object({
   TOKENOMICS_ADAPTIVE_MIN_BURN_PCT: Joi.number().integer().min(0).max(100).default(40).description('Lowest direct-burn share the adaptive policy may dial down to.'),
 
   // -------------------------------------------------------------------------
+  // Exchange settlement -> tokenomics (Module 08 x Module 11 integration)
+  //
+  // NONE is the default so that nothing is destroyed until someone chooses a
+  // policy. RETAINED_BPS attributes a share of whatever a settlement actually
+  // leaves behind - a cap on retained INR, never a claim against customer
+  // principal or LP funds, which matters because the exchange as built retains
+  // nothing: a BUY credits the customer's entire INR to the providers who
+  // supplied the USDT. VOLUME_LINKED sizes the engine on the traded INR value
+  // instead and still records zero revenue, because volume is not income; the
+  // EMBER it burns comes out of the treasury under the usual reserve floor.
+  // -------------------------------------------------------------------------
+
+  TOKENOMICS_EXCHANGE_REVENUE_MODE: Joi.string().valid('NONE', 'RETAINED_BPS', 'VOLUME_LINKED').insensitive().default('NONE').description('How a settled USDT order is sized for tokenomics: NONE queues nothing; RETAINED_BPS allocates a share of INR the settlement retained after LP credits; VOLUME_LINKED sizes the engine on the order INR value itself, for BUY and SELL alike, and claims no revenue - the EMBER it burns comes from the treasury under the usual reserve floor.'),
+
+  TOKENOMICS_EXCHANGE_REVENUE_BPS: Joi.number().integer().min(0).max(10000).default(10000).description('Basis points of retained INR attributed to the burn/buyback engine. Only read in RETAINED_BPS mode; can never exceed what was retained.'),
+
+  TOKENOMICS_EXCHANGE_WORKER_ENABLED: Joi.boolean().default(true).description('Run the background pass that drives settled orders through allocation -> buyback -> execution -> burn. Off under NODE_ENV=test, where tests call the pass directly.'),
+
+  TOKENOMICS_EXCHANGE_WORKER_INTERVAL_MS: Joi.number().integer().min(250).max(600000).default(15000).description('Milliseconds between exchange revenue passes.'),
+
+  TOKENOMICS_EXCHANGE_MAX_ATTEMPTS: Joi.number().integer().min(1).max(1000).default(12).description('Retry budget captured on each queued event, so a later config change cannot widen an old job spend.'),
+
+  // -------------------------------------------------------------------------
   // EMBER Hub distribution
   // -------------------------------------------------------------------------
 
@@ -547,6 +570,18 @@ export const envValidationSchema = Joi.object({
     .allow('')
     .default('')
     .description('POST endpoint of the local model behind /ai-doubt-solver. Empty = built-in knowledge base only. Server-side only.'),
+
+  AI_MODEL_TIMEOUT_MS: Joi.number()
+    .integer()
+    .min(1000)
+    // Hard ceiling: the BFF proxy waits 25s and the widget aborts at 30s, so
+    // waiting longer than that here would hold a request the frontend has
+    // already abandoned.
+    .max(25000)
+    .default(20000)
+    .description(
+      'How long the model gets to answer before the request falls back to the built-in knowledge base (1000-25000 ms). Raise it for a slow local model; keep it below the BFF and widget timeouts above.',
+    ),
 });
 
 /**

@@ -8,8 +8,9 @@ import {
 } from '@prisma/client';
 
 import { PrismaService } from '../../database/prisma.service';
-import { roundMoney } from '../simulation/engine/simulation-engine';
+import { WalletService } from '../wallet/wallet.service';
 import type { PaperFill } from '../paper/ports/paper-execution.port';
+import { planOrder } from '../trading/domain/position-book';
 import {
   DEFAULT_COPY_INITIAL_CASH,
   evaluateEligibility,
@@ -69,10 +70,19 @@ export interface CopyApplyResult {
  * terminating it is what stops the engine from retrying a decision that will
  * never change. Only infrastructure failures throw - and those roll the whole
  * transaction back, leaving the cursor behind so the fill is retried next pass.
+ *
+ * THE BOOK IS NET, AND SHARED WITH THE EXPERT'S LEDGER. The plan a fill
+ * produces - which way the follower's position moves, what it costs, what it
+ * realises - comes from the same kernel the expert's paper account uses, so a
+ * copy of a LONG is a LONG and a copy of a SHORT is a SHORT, and neither
+ * module can drift from the other on a rounding rule.
  */
 @Injectable()
 export class CopyExecutionService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly walletService: WalletService,
+  ) {}
 
   /**
    * Applies one expert fill to one follow.
@@ -177,13 +187,15 @@ export class CopyExecutionService {
     // sizing rules classify as `PRICE_UNAVAILABLE` rather than a price of 0.
     const expertPrice: Prisma.Decimal | null = fill.fillPrice ?? null;
 
+    const walletUsdt = await this.walletService.getAvailableBalance(follow.followerId, 'USDT', tx);
+
     const sized = sizeCopyOrder({
       side: fill.side,
       expertQuantity: fill.quantity,
       allocationFraction: follow.allocationFraction,
       fillPrice: expertPrice,
       cash: account.cash,
-      positionQuantity: position?.quantity ?? new Prisma.Decimal(0),
+      walletUsdt,
     });
 
     if (!sized.executable) {
@@ -194,7 +206,24 @@ export class CopyExecutionService {
       return this.recordRejection(tx, follow, fill, at, sized.rejectReason);
     }
 
-    if (fill.side === 'BUY') {
+    const plan = planOrder({
+      side: fill.side,
+      quantity: sized.quantity,
+      fillPrice: sized.fillPrice,
+      position:
+        position === null
+          ? null
+          : {
+              direction: position.direction,
+              quantity: position.quantity,
+              averageEntryPrice: position.averageEntryPrice,
+            },
+    });
+
+    // The cash movement is the copy's own notional, signed by its direction: a
+    // LONG spends it, a SHORT brings it in.
+    if (plan.cashDelta.lt(0)) {
+      const spend = plan.cashDelta.negated();
       // The guarded debit is both the affordability check and the concurrency
       // guard: `cash >= gross` is evaluated by PostgreSQL against the very row
       // it is about to update, so two copies racing for the last of the balance
@@ -203,61 +232,29 @@ export class CopyExecutionService {
         where: {
           followerId: follow.followerId,
           strategyId: follow.strategyId,
-          cash: { gte: sized.gross },
+          cash: { gte: spend },
         },
-        data: { cash: { decrement: sized.gross }, lastActivityAt: at },
+        data: { cash: { decrement: spend }, lastActivityAt: at },
       });
 
       if (debit.count === 0) {
         return this.recordRejection(tx, follow, fill, at, 'INSUFFICIENT_COPY_CASH');
       }
-
-      if (position === null) {
-        await tx.copyPosition.create({
-          data: {
-            followerId: follow.followerId,
-            strategyId: follow.strategyId,
-            symbol: fill.symbol,
-            quantity: sized.quantity,
-            averageEntryPrice: sized.fillPrice,
-            openedAt: at,
-            lastActivityAt: at,
-          },
-        });
-      } else {
-        const newQuantity = position.quantity.plus(sized.quantity);
-        const newAverage = position.quantity
-          .times(position.averageEntryPrice)
-          .plus(sized.quantity.times(sized.fillPrice))
-          .dividedBy(newQuantity);
-
-        await tx.copyPosition.update({
-          where: {
-            followerId_strategyId_symbol: {
-              followerId: follow.followerId,
-              strategyId: follow.strategyId,
-              symbol: fill.symbol,
-            },
-          },
-          data: {
-            quantity: roundMoney(newQuantity),
-            averageEntryPrice: roundMoney(newAverage),
-            lastActivityAt: at,
-          },
-        });
-      }
-
-      return this.recordFill(tx, follow, fill, at, sized);
+    } else if (plan.cashDelta.gt(0)) {
+      await tx.copyAccount.update({
+        where: { followerId_strategyId: { followerId: follow.followerId, strategyId: follow.strategyId } },
+        data: { cash: { increment: plan.cashDelta }, lastActivityAt: at },
+      });
     }
 
-    // SELL. `sized.quantity` is bounded by what the follower holds, so the
-    // position is known to exist and the remainder cannot go negative.
-    const held = position?.quantity ?? new Prisma.Decimal(0);
-    const entryPrice = position?.averageEntryPrice ?? new Prisma.Decimal(0);
-    const remainder = held.minus(sized.quantity);
-    const realized = sized.quantity.times(sized.fillPrice).minus(sized.quantity.times(entryPrice));
+    if (!plan.realizedPnl.isZero()) {
+      await tx.copyAccount.update({
+        where: { followerId_strategyId: { followerId: follow.followerId, strategyId: follow.strategyId } },
+        data: { realizedPnl: { increment: plan.realizedPnl }, lastActivityAt: at },
+      });
+    }
 
-    if (remainder.lte(0)) {
+    if (plan.position === null) {
       // A position that empties is deleted, never stored as a zero row: a zero
       // row would read as "held nothing" to one caller and "missing data" to
       // another, and this module refuses to make that ambiguity possible.
@@ -270,6 +267,19 @@ export class CopyExecutionService {
           },
         },
       });
+    } else if (position === null) {
+      await tx.copyPosition.create({
+        data: {
+          followerId: follow.followerId,
+          strategyId: follow.strategyId,
+          symbol: fill.symbol,
+          direction: plan.position.direction,
+          quantity: plan.position.quantity,
+          averageEntryPrice: plan.position.averageEntryPrice,
+          openedAt: at,
+          lastActivityAt: at,
+        },
+      });
     } else {
       await tx.copyPosition.update({
         where: {
@@ -279,20 +289,16 @@ export class CopyExecutionService {
             symbol: fill.symbol,
           },
         },
-        data: { quantity: roundMoney(remainder), lastActivityAt: at },
+        data: {
+          direction: plan.position.direction,
+          quantity: plan.position.quantity,
+          averageEntryPrice: plan.position.averageEntryPrice,
+          lastActivityAt: at,
+        },
       });
     }
 
-    await tx.copyAccount.update({
-      where: { followerId_strategyId: { followerId: follow.followerId, strategyId: follow.strategyId } },
-      data: {
-        cash: { increment: sized.gross },
-        realizedPnl: { increment: roundMoney(realized) },
-        lastActivityAt: at,
-      },
-    });
-
-    return this.recordFill(tx, follow, fill, at, sized);
+    return this.recordFill(tx, follow, fill, at, sized, plan.realizedPnl);
   }
 
   private async recordFill(
@@ -301,6 +307,7 @@ export class CopyExecutionService {
     fill: PaperFill,
     at: Date,
     sized: { quantity: Prisma.Decimal; fillPrice: Prisma.Decimal; gross: Prisma.Decimal },
+    realizedPnl: Prisma.Decimal,
   ): Promise<CopyEvent> {
     const event = await tx.copyEvent.create({
       data: {
@@ -316,6 +323,7 @@ export class CopyExecutionService {
         quantity: sized.quantity,
         fillPrice: sized.fillPrice,
         gross: sized.gross,
+        realizedPnl: realizedPnl.isZero() ? null : realizedPnl,
         status: 'COPIED',
         rejectReason: null,
         processedAt: at,
@@ -347,6 +355,7 @@ export class CopyExecutionService {
         quantity: new Prisma.Decimal(0),
         fillPrice: null,
         gross: null,
+        realizedPnl: null,
         status: 'REJECTED',
         rejectReason,
         processedAt: at,

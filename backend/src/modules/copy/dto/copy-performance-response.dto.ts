@@ -29,8 +29,8 @@ export class CopyPerformancePointDto {
   @ApiProperty()
   symbol!: string;
 
-  @ApiProperty({ description: 'Direction of the copied fill.', enum: ['BUY', 'SELL'] })
-  side!: 'BUY' | 'SELL';
+  @ApiProperty({ description: 'Direction of the copied fill.', enum: ['LONG', 'SHORT'] })
+  side!: 'LONG' | 'SHORT';
 
   @ApiProperty({ description: 'Quantity the follower executed.' })
   quantity!: string;
@@ -43,7 +43,8 @@ export class CopyPerformancePointDto {
 
   @ApiProperty({
     description:
-      'Profit or loss this single fill realised. Zero for a BUY - a BUY moves cash into a position and realises nothing.',
+      'Profit or loss this single fill realised. Zero for a fill that only opened or added to a position - it moves ' +
+      'cash into the book and realises nothing yet.',
   })
   realizedPnl!: string;
 

@@ -12,9 +12,9 @@ export class PlacePaperOrderDto {
   @MaxLength(20)
   symbol!: string;
 
-  @ApiProperty({ description: 'BUY or SELL, market order only.', enum: ['BUY', 'SELL'] })
-  @IsEnum(['BUY', 'SELL'] as const)
-  side!: 'BUY' | 'SELL';
+  @ApiProperty({ description: 'LONG or SHORT, market order only.', enum: ['LONG', 'SHORT'] })
+  @IsEnum(['LONG', 'SHORT'] as const)
+  side!: 'LONG' | 'SHORT';
 
   @ApiProperty({ description: 'Base-asset quantity, to be truncated to 8 places for crypto or the instrument precision.', example: '10' })
   @IsString()

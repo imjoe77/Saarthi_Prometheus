@@ -7,8 +7,10 @@ import request from 'supertest';
 import { createApp } from '../src/bootstrap';
 import type { DomainException } from '../src/common/errors/domain.exception';
 import { PrismaService } from '../src/database/prisma.service';
+import { seedAssets } from '../src/modules/assets/asset-seed';
 import { FakeMarketDataProvider } from '../src/modules/live-data/providers/fake-market-data-provider';
 import { isMarketOpen } from '../src/modules/live-data/market-state';
+import { WalletService } from '../src/modules/wallet/wallet.service';
 import { mintToken } from './token-minting';
 
 /**
@@ -21,11 +23,12 @@ interface PaperOrderPayload {
   orderId: string;
   strategyId: string;
   symbol: string;
-  side: 'BUY' | 'SELL';
+  side: 'LONG' | 'SHORT';
   quantity: string;
   status: 'FILLED' | 'REJECTED';
   rejectReason: string | null;
   fillPrice: string | null;
+  realizedPnl: string | null;
   placedAt: string;
   filledAt: string | null;
   clientRequestId: string;
@@ -41,8 +44,13 @@ interface PaperAccountPayload {
 
 interface PaperPositionPayload {
   symbol: string;
+  direction: 'LONG' | 'SHORT';
   quantity: string;
   averageEntryPrice: string;
+  markPrice: string | null;
+  marketValue: string | null;
+  unrealizedPnl: string | null;
+  stale: boolean;
   openedAt: string;
   lastActivityAt: string;
 }
@@ -50,6 +58,7 @@ interface PaperPositionPayload {
 interface PaperSummaryPayload {
   account: PaperAccountPayload | null;
   positions: PaperPositionPayload[];
+  walletUsdt: string;
 }
 
 interface ErrorPayload {
@@ -85,6 +94,7 @@ describe('Paper Trading (e2e)', () => {
   let app: INestApplication;
   let prisma: PrismaService;
   let fake: FakeMarketDataProvider;
+  let walletService: WalletService;
 
   const createdUserIds: string[] = [];
 
@@ -98,6 +108,10 @@ describe('Paper Trading (e2e)', () => {
 
     prisma = app.get(PrismaService);
     fake = app.get(FakeMarketDataProvider);
+    walletService = app.get(WalletService);
+
+    // The USDT balance every order's notional is checked against.
+    await seedAssets(prisma);
   });
 
   afterAll(async () => {
@@ -113,6 +127,8 @@ describe('Paper Trading (e2e)', () => {
       }
 
       await prisma.strategy.deleteMany({ where });
+      await prisma.transaction.deleteMany({ where: { wallet: { userId: { in: createdUserIds } } } });
+      await prisma.walletBalance.deleteMany({ where: { wallet: { userId: { in: createdUserIds } } } });
       await prisma.wallet.deleteMany({ where: { userId: { in: createdUserIds } } });
       await prisma.user.deleteMany({ where: { id: { in: createdUserIds } } });
     }
@@ -123,13 +139,34 @@ describe('Paper Trading (e2e)', () => {
   const http = () => request(app.getHttpServer());
   const bearer = (token: string) => ({ Authorization: `Bearer ${token}` });
 
+  /**
+   * Credits the user's real USDT balance.
+   *
+   * Every order's notional has to be covered by the trader's wallet, so a user
+   * with no USDT cannot trade at all. The credit goes through the real wallet
+   * ledger - it is a DEPOSIT row, not a patched balance - so the balance the
+   * gate reads is a balance the system actually holds.
+   */
+  async function fundUsdt(userId: string, amount: string): Promise<void> {
+    const wallet = await prisma.wallet.upsert({
+      where: { userId },
+      create: { userId },
+      update: {},
+    });
+    const asset = await prisma.asset.findUniqueOrThrow({ where: { symbol: 'USDT' } });
+
+    await walletService.credit(wallet.id, asset.id, amount);
+  }
+
   /** Creates a Prometheus user through the real auth path and returns a token. */
-  async function createUser(label: string): Promise<{ token: string; userId: string }> {
+  async function createUser(label: string, usdt = '1000000'): Promise<{ token: string; userId: string }> {
     const email = `${label}-${randomUUID()}@paper.test`;
     const token = await mintToken({ subject: `google:${label}-${randomUUID()}`, email });
 
     const response = await http().get('/api/auth/me').set(bearer(token)).expect(200);
     createdUserIds.push(response.body.id);
+
+    await fundUsdt(response.body.id, usdt);
 
     return { token, userId: response.body.id };
   }
@@ -148,7 +185,7 @@ describe('Paper Trading (e2e)', () => {
   interface PlaceOrderOptions {
     clientRequestId?: string;
     quantity?: string;
-    side?: 'BUY' | 'SELL';
+    side?: 'LONG' | 'SHORT';
     symbol?: string;
   }
 
@@ -164,7 +201,7 @@ describe('Paper Trading (e2e)', () => {
       .send({
         clientRequestId: options.clientRequestId ?? randomUUID(),
         symbol: options.symbol ?? 'SOL/USD',
-        side: options.side ?? 'BUY',
+        side: options.side ?? 'LONG',
         quantity: options.quantity ?? '1',
       });
   }
@@ -225,7 +262,7 @@ describe('Paper Trading (e2e)', () => {
       await http()
         .post('/api/strategies/joel/paper/orders')
         .set(bearer(user.token))
-        .send({ clientRequestId: randomUUID(), symbol: 'SOL/USD', side: 'BUY', quantity: '1' })
+        .send({ clientRequestId: randomUUID(), symbol: 'SOL/USD', side: 'LONG', quantity: '1' })
         .expect(400);
     });
 
@@ -288,9 +325,9 @@ describe('Paper Trading (e2e)', () => {
   // ---------------------------------------------------------------------------
 
   describe('fills', () => {
-    it('fills a BUY at the ask, debits cash and opens a position', async () => {
-      const user = await createUser('buyfill');
-      const strategyId = await createStrategy(user.token, 'buyfill');
+    it('fills a LONG at the ask, debits cash and opens a position', async () => {
+      const user = await createUser('longfill');
+      const strategyId = await createStrategy(user.token, 'longfill');
       seedFreshQuote('SOL/USD', '169.5', '170.5');
 
       const response = await placeOrder(user.token, strategyId, { quantity: '2' }).expect(201);
@@ -300,7 +337,7 @@ describe('Paper Trading (e2e)', () => {
       expect(order.rejectReason).toBeNull();
       expect(order.fillPrice).toBe('170.5');
       expect(order.symbol).toBe('SOL/USD');
-      expect(order.side).toBe('BUY');
+      expect(order.side).toBe('LONG');
       expect(order.quantity).toBe('2');
       expect(order.filledAt).not.toBeNull();
 
@@ -314,12 +351,13 @@ describe('Paper Trading (e2e)', () => {
       expect(after.positions).toHaveLength(1);
       expect(after.positions[0]).toMatchObject({
         symbol: 'SOL/USD',
+        direction: 'LONG',
         quantity: '2',
         averageEntryPrice: '170.5',
       });
     });
 
-    it('fills a second BUY by blending the average entry price', async () => {
+    it('fills a second LONG by blending the average entry price', async () => {
       const user = await createUser('blend');
       const strategyId = await createStrategy(user.token, 'blend');
 
@@ -338,19 +376,20 @@ describe('Paper Trading (e2e)', () => {
       expect(after.account?.cash).toBe('99498.5');
     });
 
-    it('fills a SELL at the bid, credits cash and realises P&L against the entry price', async () => {
-      const user = await createUser('sellfill');
-      const strategyId = await createStrategy(user.token, 'sellfill');
+    it('fills a SHORT at the bid, closes the long and realises P&L against the entry price', async () => {
+      const user = await createUser('shortfill');
+      const strategyId = await createStrategy(user.token, 'shortfill');
 
       seedFreshQuote('SOL/USD', '99.5', '100.5');
       await placeOrder(user.token, strategyId, { quantity: '4' }).expect(201);
 
       seedFreshQuote('SOL/USD', '149.5', '150.5');
-      const response = await placeOrder(user.token, strategyId, { side: 'SELL', quantity: '4' }).expect(201);
+      const response = await placeOrder(user.token, strategyId, { side: 'SHORT', quantity: '4' }).expect(201);
       const order = response.body as PaperOrderPayload;
 
       expect(order.status).toBe('FILLED');
       expect(order.fillPrice).toBe('149.5');
+      expect(order.realizedPnl).toBe('196');
 
       const after = await summary(user.token, strategyId);
       // Realised = (149.5 - 100.5) * 4 = 196. Cash = 100000 - 402 + 598 = 100196.
@@ -360,7 +399,31 @@ describe('Paper Trading (e2e)', () => {
       expect(after.positions).toEqual([]);
     });
 
-    it('partially sells, leaving the remainder open at the unchanged entry price', async () => {
+    it('opens a short against a flat book, bringing the notional in', async () => {
+      const user = await createUser('openshort');
+      const strategyId = await createStrategy(user.token, 'openshort');
+
+      seedFreshQuote('SOL/USD', '99.5', '100.5');
+      const response = await placeOrder(user.token, strategyId, { side: 'SHORT', quantity: '2' }).expect(201);
+      const order = response.body as PaperOrderPayload;
+
+      expect(order.status).toBe('FILLED');
+      expect(order.fillPrice).toBe('99.5');
+      expect(order.realizedPnl).toBeNull();
+
+      const after = await summary(user.token, strategyId);
+      expect(after.positions).toHaveLength(1);
+      expect(after.positions[0]).toMatchObject({
+        direction: 'SHORT',
+        quantity: '2',
+        averageEntryPrice: '99.5',
+      });
+      // 100000 + (2 * 99.5) = 100199
+      expect(after.account?.cash).toBe('100199');
+      expect(after.account?.realizedPnl).toBe('0');
+    });
+
+    it('partially closes, leaving the remainder open at the unchanged entry price', async () => {
       const user = await createUser('partial');
       const strategyId = await createStrategy(user.token, 'partial');
 
@@ -368,11 +431,12 @@ describe('Paper Trading (e2e)', () => {
       await placeOrder(user.token, strategyId, { quantity: '3' }).expect(201);
 
       seedFreshQuote('SOL/USD', '249.5', '250.5');
-      await placeOrder(user.token, strategyId, { side: 'SELL', quantity: '1' }).expect(201);
+      await placeOrder(user.token, strategyId, { side: 'SHORT', quantity: '1' }).expect(201);
 
       const after = await summary(user.token, strategyId);
       expect(after.positions).toHaveLength(1);
       expect(after.positions[0]?.quantity).toBe('2');
+      expect(after.positions[0]?.direction).toBe('LONG');
       expect(after.positions[0]?.averageEntryPrice).toBe('200.5');
       expect(after.account?.realizedPnl).toBe('49');
     });
@@ -408,30 +472,70 @@ describe('Paper Trading (e2e)', () => {
 
   // ---------------------------------------------------------------------------
 
-  describe('rejections', () => {
-    it('rejects a SELL larger than the position with INSUFFICIENT_POSITION', async () => {
-      const user = await createUser('shortsell');
-      const strategyId = await createStrategy(user.token, 'shortsell');
-      seedFreshQuote('SOL/USD', '9.5', '10.5');
+  describe('closing a position', () => {
+    it('closes the open position with an order in the opposite direction', async () => {
+      const user = await createUser('close');
+      const strategyId = await createStrategy(user.token, 'close');
 
+      seedFreshQuote('SOL/USD', '99.5', '100.5');
       await placeOrder(user.token, strategyId, { quantity: '2' }).expect(201);
 
-      seedFreshQuote('SOL/USD', '19.5', '20.5');
-      const response = await placeOrder(user.token, strategyId, { side: 'SELL', quantity: '5' }).expect(201);
+      seedFreshQuote('SOL/USD', '149.5', '150.5');
+      const response = await http()
+        .post(`/api/strategies/${strategyId}/paper/positions/SOL%2FUSD/close`)
+        .set(bearer(user.token))
+        .expect(201);
+      const order = response.body as PaperOrderPayload;
+
+      expect(order.status).toBe('FILLED');
+      expect(order.side).toBe('SHORT');
+      expect(order.quantity).toBe('2');
+      expect(order.fillPrice).toBe('149.5');
+      expect(order.realizedPnl).toBe('98');
+
+      const after = await summary(user.token, strategyId);
+      expect(after.positions).toEqual([]);
+      expect(after.account?.realizedPnl).toBe('98');
+      expect(after.account?.cash).toBe('100098'); // 100000 - 201 + 299
+    });
+
+    it('404s when the strategy holds no position for that symbol', async () => {
+      const user = await createUser('close-none');
+      const strategyId = await createStrategy(user.token, 'close-none');
+
+      await http()
+        .post(`/api/strategies/${strategyId}/paper/positions/SOL%2FUSD/close`)
+        .set(bearer(user.token))
+        .expect(404);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+
+  describe('rejections', () => {
+    it('rejects a LONG the real wallet cannot cover with INSUFFICIENT_WALLET_BALANCE', async () => {
+      const user = await createUser('nowallet', '10');
+      const strategyId = await createStrategy(user.token, 'nowallet');
+      seedFreshQuote('SOL/USD', '99.5', '100.5');
+
+      const response = await placeOrder(user.token, strategyId, { quantity: '2' }).expect(201);
       const order = response.body as PaperOrderPayload;
 
       expect(order.status).toBe('REJECTED');
-      expect(order.rejectReason).toBe('INSUFFICIENT_POSITION');
+      expect(order.rejectReason).toBe('INSUFFICIENT_WALLET_BALANCE');
       expect(order.fillPrice).toBeNull();
 
-      // The failed sell moves nothing.
+      // The refusal moves nothing: no position opens and the pot is untouched.
       const after = await summary(user.token, strategyId);
-      expect(after.positions[0]?.quantity).toBe('2');
-      expect(after.account?.cash).toBe('99979');
+      expect(after.positions).toEqual([]);
+      expect(after.account?.cash).toBe('100000');
       expect(after.account?.realizedPnl).toBe('0');
+      // The wallet is reported as it is: the balance that could not cover the
+      // order is the reason the order was refused.
+      expect(after.walletUsdt).toBe('10');
     });
 
-    it('rejects a BUY that costs more than the paper cash with INSUFFICIENT_PAPER_CASH', async () => {
+    it('rejects a LONG that costs more than the paper cash with INSUFFICIENT_PAPER_CASH', async () => {
       const user = await createUser('overdraft');
       const strategyId = await createStrategy(user.token, 'overdraft');
       // 5000 * 30 = 150000, well beyond the 100000 opening cash.
@@ -574,7 +678,7 @@ describe('Paper Trading (e2e)', () => {
   // ---------------------------------------------------------------------------
 
   describe('concurrency', () => {
-    it('never oversells paper cash when several BUYs race on the same strategy', async () => {
+    it('never oversells paper cash when several LONGs race on the same strategy', async () => {
       const user = await createUser('race');
       const strategyId = await createStrategy(user.token, 'race');
 
@@ -606,32 +710,39 @@ describe('Paper Trading (e2e)', () => {
       expect(after.positions[0]?.quantity).toBe('2');
     });
 
-    it('serialises concurrent BUYs and SELLs so a position cannot go negative', async () => {
+    it('serialises concurrent orders so the book never contradicts itself', async () => {
       const user = await createUser('mixedrace');
       const strategyId = await createStrategy(user.token, 'mixedrace');
 
       seedFreshQuote('SOL/USD', '99.5', '100.5');
       await placeOrder(user.token, strategyId, { quantity: '2' }).expect(201);
 
+      // Three identical SHORTs against a long of 2. The advisory lock runs them
+      // one at a time, so two of them close the long and the third opens a
+      // short against a flat book - which is a short, not a refusal.
       seedFreshQuote('SOL/USD', '149.5', '150.5');
       const results = await Promise.all([
-        placeOrder(user.token, strategyId, { side: 'SELL', quantity: '1' }),
-        placeOrder(user.token, strategyId, { side: 'SELL', quantity: '1' }),
-        placeOrder(user.token, strategyId, { side: 'SELL', quantity: '1' }),
+        placeOrder(user.token, strategyId, { side: 'SHORT', quantity: '1' }),
+        placeOrder(user.token, strategyId, { side: 'SHORT', quantity: '1' }),
+        placeOrder(user.token, strategyId, { side: 'SHORT', quantity: '1' }),
       ]);
 
       const filled = results.filter((r) => (r.body as PaperOrderPayload).status === 'FILLED');
       const rejected = results.filter((r) => (r.body as PaperOrderPayload).status === 'REJECTED');
 
-      expect(filled).toHaveLength(2);
-      expect(rejected).toHaveLength(1);
-      expect((rejected[0]?.body as PaperOrderPayload).rejectReason).toBe('INSUFFICIENT_POSITION');
+      expect(filled).toHaveLength(3);
+      expect(rejected).toHaveLength(0);
 
       const after = await summary(user.token, strategyId);
-      expect(after.positions).toEqual([]);
-      // (149.5 - 100.5) * 2 = 98 realised; cash 100000 - 201 + 299 = 100098.
+      expect(after.positions).toHaveLength(1);
+      expect(after.positions[0]).toMatchObject({
+        direction: 'SHORT',
+        quantity: '1',
+        averageEntryPrice: '149.5',
+      });
+      // (149.5 - 100.5) * 2 = 98 realised; cash 100000 - 201 + 448.5 = 100247.5.
       expect(after.account?.realizedPnl).toBe('98');
-      expect(after.account?.cash).toBe('100098');
+      expect(after.account?.cash).toBe('100247.5');
     });
   });
 
@@ -644,19 +755,24 @@ describe('Paper Trading (e2e)', () => {
 
       seedFreshQuote('SOL/USD', '19.5', '20.5');
       await placeOrder(user.token, strategyId, { quantity: '1' }).expect(201);
-      await placeOrder(user.token, strategyId, { side: 'SELL', quantity: '5' }).expect(201);
+
+      // 5000 * 30 = 150000, beyond the 100000 opening cash: a refusal with a
+      // reason and no price, which is what the history has to show.
+      seedFreshQuote('BTC/USD', '29.5', '30');
+      await placeOrder(user.token, strategyId, { symbol: 'BTC/USD', quantity: '5000' }).expect(201);
+
       await placeOrder(user.token, strategyId, { symbol: 'DOGE/USD' }).expect(404);
 
       const history = await orders(user.token, strategyId);
       expect(history).toHaveLength(2);
 
-      expect(history[0]?.side).toBe('SELL');
+      expect(history[0]?.side).toBe('LONG');
       expect(history[0]?.status).toBe('REJECTED');
-      expect(history[0]?.rejectReason).toBe('INSUFFICIENT_POSITION');
+      expect(history[0]?.rejectReason).toBe('INSUFFICIENT_PAPER_CASH');
       expect(history[0]?.fillPrice).toBeNull();
       expect(history[0]?.filledAt).toBeNull();
 
-      expect(history[1]?.side).toBe('BUY');
+      expect(history[1]?.side).toBe('LONG');
       expect(history[1]?.status).toBe('FILLED');
       expect(history[1]?.fillPrice).toBe('20.5');
       expect(history[1]?.filledAt).not.toBeNull();

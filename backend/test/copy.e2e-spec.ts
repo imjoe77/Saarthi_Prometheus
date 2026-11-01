@@ -7,8 +7,10 @@ import request from 'supertest';
 import { createApp } from '../src/bootstrap';
 import type { DomainException } from '../src/common/errors/domain.exception';
 import { PrismaService } from '../src/database/prisma.service';
+import { seedAssets } from '../src/modules/assets/asset-seed';
 import { CopyWorkerService } from '../src/modules/copy/copy-worker.service';
 import { FakeMarketDataProvider } from '../src/modules/live-data/providers/fake-market-data-provider';
+import { WalletService } from '../src/modules/wallet/wallet.service';
 import { mintToken } from './token-minting';
 
 /**
@@ -46,7 +48,7 @@ interface FollowStatusPayload extends FollowPayload {
 interface CopyEventPayload {
   expertOrderId: string;
   symbol: string;
-  side: 'BUY' | 'SELL';
+  side: 'LONG' | 'SHORT';
   expertQuantity: string;
   expertFillPrice: string | null;
   expertFilledAt: string;
@@ -54,6 +56,7 @@ interface CopyEventPayload {
   quantity: string | null;
   fillPrice: string | null;
   gross: string | null;
+  realizedPnl: string | null;
   status: 'COPIED' | 'REJECTED';
   rejectReason: string | null;
   processedAt: string;
@@ -69,8 +72,13 @@ interface CopyAccountPayload {
 
 interface CopyPositionPayload {
   symbol: string;
+  direction: 'LONG' | 'SHORT';
   quantity: string;
   averageEntryPrice: string;
+  markPrice: string | null;
+  marketValue: string | null;
+  unrealizedPnl: string | null;
+  stale: boolean;
   openedAt: string;
   lastActivityAt: string;
 }
@@ -78,13 +86,25 @@ interface CopyPositionPayload {
 interface FollowAccountPayload {
   account: CopyAccountPayload | null;
   positions: CopyPositionPayload[];
+  walletUsdt: string;
 }
 
 interface AggregateAccountPayload {
   followCount: number;
   cash: string;
   realizedPnl: string;
-  positions: Array<{ symbol: string; quantity: string; averageEntryPrice: string; followCount: number }>;
+  walletUsdt: string;
+  positions: Array<{
+    symbol: string;
+    direction: 'LONG' | 'SHORT';
+    quantity: string;
+    averageEntryPrice: string;
+    markPrice: string | null;
+    marketValue: string | null;
+    unrealizedPnl: string | null;
+    stale: boolean;
+    followCount: number;
+  }>;
 }
 
 interface FollowerPayload {
@@ -143,6 +163,7 @@ describe('Copy Trading (e2e)', () => {
   let prisma: PrismaService;
   let fake: FakeMarketDataProvider;
   let worker: CopyWorkerService;
+  let walletService: WalletService;
 
   const createdUserIds: string[] = [];
 
@@ -159,6 +180,11 @@ describe('Copy Trading (e2e)', () => {
     prisma = app.get(PrismaService);
     fake = app.get(FakeMarketDataProvider);
     worker = app.get(CopyWorkerService);
+    walletService = app.get(WalletService);
+
+    // The USDT balance every order's notional - and every copy's - is
+    // checked against.
+    await seedAssets(prisma);
   });
 
   afterAll(async () => {
@@ -186,6 +212,8 @@ describe('Copy Trading (e2e)', () => {
       }
 
       await prisma.strategy.deleteMany({ where: ownerWhere });
+      await prisma.transaction.deleteMany({ where: { wallet: { userId: { in: createdUserIds } } } });
+      await prisma.walletBalance.deleteMany({ where: { wallet: { userId: { in: createdUserIds } } } });
       await prisma.wallet.deleteMany({ where: { userId: { in: createdUserIds } } });
       await prisma.user.deleteMany({ where: { id: { in: createdUserIds } } });
     }
@@ -199,12 +227,36 @@ describe('Copy Trading (e2e)', () => {
   /** Lets two statements land in different milliseconds when a boundary matters. */
   const delay = (ms = 10) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  async function createUser(label: string): Promise<{ token: string; userId: string; email: string }> {
+  /**
+   * Credits the user's real USDT balance.
+   *
+   * Both halves of a copy are gated by the wallet: the expert's order needs
+   * the notional covered, and so does the follower's copy of it. The credit
+   * goes through the real wallet ledger, so the balance the gate reads is a
+   * balance the system actually holds.
+   */
+  async function fundUsdt(userId: string, amount: string): Promise<void> {
+    const wallet = await prisma.wallet.upsert({
+      where: { userId },
+      create: { userId },
+      update: {},
+    });
+    const asset = await prisma.asset.findUniqueOrThrow({ where: { symbol: 'USDT' } });
+
+    await walletService.credit(wallet.id, asset.id, amount);
+  }
+
+  async function createUser(
+    label: string,
+    usdt = '1000000',
+  ): Promise<{ token: string; userId: string; email: string }> {
     const email = `${label}-${randomUUID()}@copy.test`;
     const token = await mintToken({ subject: `google:${label}-${randomUUID()}`, email });
 
     const response = await http().get('/api/auth/me').set(bearer(token)).expect(200);
     createdUserIds.push(response.body.id as string);
+
+    await fundUsdt(response.body.id as string, usdt);
 
     return { token, userId: response.body.id as string, email };
   }
@@ -227,7 +279,7 @@ describe('Copy Trading (e2e)', () => {
   function placeOrder(
     token: string,
     strategyId: string,
-    options: { quantity?: string; side?: 'BUY' | 'SELL'; symbol?: string } = {},
+    options: { quantity?: string; side?: 'LONG' | 'SHORT'; symbol?: string } = {},
   ): request.Test {
     return http()
       .post(`/api/strategies/${strategyId}/paper/orders`)
@@ -235,7 +287,7 @@ describe('Copy Trading (e2e)', () => {
       .send({
         clientRequestId: randomUUID(),
         symbol: options.symbol ?? 'SOL/USD',
-        side: options.side ?? 'BUY',
+        side: options.side ?? 'LONG',
         quantity: options.quantity ?? '1',
       });
   }
@@ -401,7 +453,11 @@ describe('Copy Trading (e2e)', () => {
       // Nothing has been copied, so there is no pot to report - `null`, not a
       // balance that would invite arithmetic nobody can justify.
       const account = await followAccount(follower.token, strategyId);
-      expect(account).toEqual({ account: null, positions: [] });
+      expect(account.account).toBeNull();
+      expect(account.positions).toEqual([]);
+      // The wallet balance is the gate every further copy has to pass, so it
+      // is reported even when no copy has happened yet.
+      expect(account.walletUsdt).toBe('1000000');
 
       const aggregate = await aggregateAccount(follower.token);
       expect(aggregate).toMatchObject({ followCount: 1, cash: '0', realizedPnl: '0', positions: [] });
@@ -506,7 +562,7 @@ describe('Copy Trading (e2e)', () => {
 
   // ---------------------------------------------------------------------------
 
-  describe('copying a BUY', () => {
+  describe('copying a LONG', () => {
     it('mirrors a fraction of the expert fill at the expert price, and debits only the copy pot', async () => {
       const { owner, follower, strategyId } = await fixture('copy-buy');
       await follow(follower.token, strategyId, '0.25').expect(201);
@@ -533,7 +589,7 @@ describe('Copy Trading (e2e)', () => {
       expect(history[0]).toMatchObject({
         expertOrderId: expertOrders[0]?.orderId,
         symbol: 'SOL/USD',
-        side: 'BUY',
+        side: 'LONG',
         expertQuantity: '4',
         expertFillPrice: '100.5',
         allocationFraction: '0.25',
@@ -550,6 +606,7 @@ describe('Copy Trading (e2e)', () => {
       expect(account.positions).toHaveLength(1);
       expect(account.positions[0]).toMatchObject({
         symbol: 'SOL/USD',
+        direction: 'LONG',
         quantity: '1',
         averageEntryPrice: '100.5',
       });
@@ -577,6 +634,7 @@ describe('Copy Trading (e2e)', () => {
       const account = await followAccount(follower.token, strategyId);
       expect(account.positions).toHaveLength(1);
       expect(account.positions[0]).toMatchObject({
+        direction: 'LONG',
         quantity: '3',
         averageEntryPrice: '167.16666666666666667',
       });
@@ -586,7 +644,7 @@ describe('Copy Trading (e2e)', () => {
 
   // ---------------------------------------------------------------------------
 
-  describe('copying a SELL', () => {
+  describe('copying a SHORT', () => {
     it('closes the position, credits the pot and realizes P&L against the entry price', async () => {
       const { owner, follower, strategyId } = await fixture('copy-sell');
       await follow(follower.token, strategyId, '1').expect(201);
@@ -596,18 +654,19 @@ describe('Copy Trading (e2e)', () => {
       await sync(follower.token, strategyId).expect(200);
 
       seedFreshQuote('SOL/USD', '149.5', '150.5');
-      await placeOrder(owner.token, strategyId, { side: 'SELL', quantity: '4' }).expect(201);
+      await placeOrder(owner.token, strategyId, { side: 'SHORT', quantity: '4' }).expect(201);
       await sync(follower.token, strategyId).expect(200);
 
       const history = await copyOrders(follower.token, strategyId);
       expect(history).toHaveLength(2);
       expect(history[0]).toMatchObject({
-        side: 'SELL',
+        side: 'SHORT',
         expertQuantity: '4',
         expertFillPrice: '149.5',
         quantity: '4',
         fillPrice: '149.5',
         gross: '598',
+        realizedPnl: '196',
         status: 'COPIED',
       });
 
@@ -618,8 +677,8 @@ describe('Copy Trading (e2e)', () => {
       expect(account.positions).toEqual([]);
     });
 
-    it('sells only what the follower holds when their position is smaller than the expert\'s', async () => {
-      const { owner, follower, strategyId } = await fixture('copy-partial');
+    it('opens a short when the follower holds nothing, because a SHORT is a direction', async () => {
+      const { owner, follower, strategyId } = await fixture('copy-short');
 
       seedFreshQuote('SOL/USD', '99.5', '100.5');
       await placeOrder(owner.token, strategyId, { quantity: '4' }).expect(201);
@@ -629,33 +688,75 @@ describe('Copy Trading (e2e)', () => {
       await follow(follower.token, strategyId, '1').expect(201);
 
       seedFreshQuote('SOL/USD', '149.5', '150.5');
-      await placeOrder(owner.token, strategyId, { side: 'SELL', quantity: '4' }).expect(201);
+      await placeOrder(owner.token, strategyId, { side: 'SHORT', quantity: '4' }).expect(201);
       const response = await sync(follower.token, strategyId).expect(200);
       expect((response.body as SyncPayload).consumed).toBe(1);
 
+      // The book is net: a SHORT against a flat book is not a refusal, it is
+      // the opening of a short position. The notional comes in.
       const history = await copyOrders(follower.token, strategyId);
       expect(history).toHaveLength(1);
       expect(history[0]).toMatchObject({
-        status: 'REJECTED',
-        rejectReason: 'INSUFFICIENT_POSITION',
-        quantity: null,
-        fillPrice: null,
-        gross: null,
+        status: 'COPIED',
+        side: 'SHORT',
+        quantity: '4',
+        fillPrice: '149.5',
+        gross: '598',
+        realizedPnl: null,
+        rejectReason: null,
       });
 
-      // An eligible fill refused for want of a position still provisions the
-      // pot - it is the *ineligible* refusals that leave it absent - and moves
-      // nothing in it.
       const account = await followAccount(follower.token, strategyId);
-      expect(account.account?.cash).toBe('100000');
-      expect(account.positions).toEqual([]);
+      expect(account.account?.cash).toBe('100598'); // 100000 + 598
+      expect(account.account?.realizedPnl).toBe('0');
+      expect(account.positions).toHaveLength(1);
+      expect(account.positions[0]).toMatchObject({
+        symbol: 'SOL/USD',
+        direction: 'SHORT',
+        quantity: '4',
+        averageEntryPrice: '149.5',
+      });
+    });
+
+    it('reduces the follower\'s long and opens a short with the leftover', async () => {
+      const { owner, follower, strategyId } = await fixture('copy-flip');
+      await follow(follower.token, strategyId, '1').expect(201);
+
+      seedFreshQuote('SOL/USD', '99.5', '100.5');
+      await placeOrder(owner.token, strategyId, { quantity: '2' }).expect(201);
+      await sync(follower.token, strategyId).expect(200);
+
+      // The expert closes more than the follower holds: the follower's long
+      // is closed first and the remainder opens a short in the order's own
+      // direction, at the fill price.
+      seedFreshQuote('SOL/USD', '149.5', '150.5');
+      await placeOrder(owner.token, strategyId, { side: 'SHORT', quantity: '4' }).expect(201);
+      await sync(follower.token, strategyId).expect(200);
+
+      const history = await copyOrders(follower.token, strategyId);
+      expect(history[0]).toMatchObject({
+        status: 'COPIED',
+        side: 'SHORT',
+        quantity: '4',
+        realizedPnl: '98', // (149.5 - 100.5) x 2
+      });
+
+      const account = await followAccount(follower.token, strategyId);
+      expect(account.account?.cash).toBe('100397'); // 99799 + 598
+      expect(account.account?.realizedPnl).toBe('98');
+      expect(account.positions).toHaveLength(1);
+      expect(account.positions[0]).toMatchObject({
+        direction: 'SHORT',
+        quantity: '2',
+        averageEntryPrice: '149.5',
+      });
     });
   });
 
   // ---------------------------------------------------------------------------
 
   describe('refusals', () => {
-    it('refuses a BUY the copy pot cannot fund, and moves nothing', async () => {
+    it('refuses a LONG the copy pot cannot fund, and moves nothing', async () => {
       const { owner, follower, strategyId } = await fixture('copy-poor');
       await follow(follower.token, strategyId, '1').expect(201);
 
@@ -706,7 +807,7 @@ describe('Copy Trading (e2e)', () => {
           strategyId,
           clientRequestId: randomUUID(),
           symbol: 'SOL/USD',
-          side: 'BUY',
+          side: 'LONG',
           quantity: '1',
           status: 'FILLED',
           filledAt: new Date(),
@@ -788,7 +889,11 @@ describe('Copy Trading (e2e)', () => {
 
       // No pot was ever provisioned: an ineligible fill never touches money.
       const account = await followAccount(follower.token, strategyId);
-      expect(account).toEqual({ account: null, positions: [] });
+      expect(account.account).toBeNull();
+      expect(account.positions).toEqual([]);
+      // The wallet balance is the gate every further copy has to pass, so it
+      // is reported even when no copy has happened yet.
+      expect(account.walletUsdt).toBe('1000000');
 
       // Idempotent: the second unfollow reports the same state, not an error.
       const again = await http()
@@ -825,7 +930,11 @@ describe('Copy Trading (e2e)', () => {
       expect(history[0]).toMatchObject({ status: 'REJECTED', rejectReason: 'FOLLOW_NOT_ACTIVE' });
 
       const account = await followAccount(follower.token, strategyId);
-      expect(account).toEqual({ account: null, positions: [] });
+      expect(account.account).toBeNull();
+      expect(account.positions).toEqual([]);
+      // The wallet balance is the gate every further copy has to pass, so it
+      // is reported even when no copy has happened yet.
+      expect(account.walletUsdt).toBe('1000000');
     });
 
     it('resumes the same relationship when the follower comes back', async () => {
@@ -877,7 +986,11 @@ describe('Copy Trading (e2e)', () => {
       });
 
       const account = await followAccount(follower.token, strategyId);
-      expect(account).toEqual({ account: null, positions: [] });
+      expect(account.account).toBeNull();
+      expect(account.positions).toEqual([]);
+      // The wallet balance is the gate every further copy has to pass, so it
+      // is reported even when no copy has happened yet.
+      expect(account.walletUsdt).toBe('1000000');
     });
   });
 

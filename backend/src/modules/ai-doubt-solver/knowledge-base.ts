@@ -274,6 +274,72 @@ export const KNOWLEDGE_BASE: KnowledgeEntry[] = [
     remember: 'Fees are a fixed cost against small balances, so they matter disproportionately for tiny transactions.',
   },
   {
+    id: 'long-short-position',
+    concept: 'Long and short positions',
+    keywords: [
+      'long position',
+      'short position',
+      'long and short',
+      'long vs short',
+      'go long',
+      'go short',
+      'long trade',
+      'short trade',
+      'short selling',
+      'short sale',
+      'directional position',
+      'being long',
+      'being short',
+      'sell first',
+      'buy first',
+    ],
+    what: 'A long position is held after buying, in the expectation of a rise; a short position is held after selling, in the expectation of a fall.',
+    simple: 'A long means you buy first and sell later; a short means you sell first and buy back later.',
+    howItWorks: 'Both are held against a cash balance: a long spends it, a short receives the notional and sets aside what it will cost to buy the asset back. The profit is the price move times the quantity, signed by the direction — up for a long, down for a short — and the position is closed by an opposite trade, which is when the result becomes realised.',
+    example: 'Buying 1 unit at 100 and selling it at 120 realises 20 on a long. Selling 1 unit at 100 and buying it back at 80 realises 20 on a short, and loses 20 if the price instead reaches 120.',
+    remember: 'A short is not a smaller long: it is the other direction, and it wins when the price falls and loses when it rises.',
+  },
+  {
+    id: 'stop-loss-take-profit',
+    concept: 'Stop loss and take profit',
+    keywords: [
+      'stop loss',
+      'stop-loss',
+      'take profit',
+      'take-profit',
+      'trailing stop',
+      'target price',
+      'lock in profit',
+      'cut the loss',
+      'exit plan',
+    ],
+    what: 'A stop loss is an order that closes a position once the price reaches a chosen level; a take profit is an order that closes it once the price reaches a chosen target.',
+    simple: 'A stop loss decides in advance where to get out if you are wrong, and a take profit decides in advance where to get out if you are right.',
+    howItWorks: 'Both are resting orders tied to a trigger price, so they execute without you watching the screen. The gap between the entry and the trigger is the amount of loss or gain the trade is allowed to produce, and a trailing stop moves its trigger with the price so it protects a gain that has already run.',
+    example: 'Entering a long at 100 with a stop at 95 caps the loss at 5 per unit; the same trade with a take profit at 110 closes at 110 for a gain of 10 per unit.',
+    remember: 'A stop loss caps a loss but can also cut a winner short, and a take profit locks a gain but can leave more on the table — they trade certainty against upside.',
+  },
+  {
+    id: 'leverage-liquidation',
+    concept: 'Leverage, margin and liquidation',
+    keywords: [
+      'leverage',
+      'margin',
+      'liquidation',
+      'liquidated',
+      'margin call',
+      'borrowed money',
+      'cross margin',
+      'isolated margin',
+      'position multiplier',
+    ],
+    what: 'Leverage is borrowed money used to open a position larger than the capital committed; a liquidation is the forced close of that position when the loss reaches the margin.',
+    simple: 'Leverage multiplies your gains and your losses, and if the loss gets big enough the exchange takes the position away from you.',
+    howItWorks: 'The margin committed is compared against the position notional to give the effective multiple. The closer that multiple is to 1, the less room there is before the loss consumes the margin, and the forced close happens at a threshold rather than at a price you chose.',
+    example: 'With $100 of margin on a $500 position the effective leverage is 5x, so a 20% move against the position wipes out the margin — far less than the 100% move the full position would need.',
+    remember: 'Leverage does not create a return; it only changes how much of your own money the move is measured against, and it makes a forced exit more likely.',
+  },
+  {
     id: 'smart-contract',
     concept: 'Smart contracts',
     keywords: ['smart contract', 'on chain', 'onchain', 'immutable code', 'audit', 'blockchain', 'web3', 'decentralised'],
@@ -296,17 +362,27 @@ export const FALLBACK_ENTRY: KnowledgeEntry = {
   keywords: [],
   what: 'The built-in knowledge base answers from a curated list of platform and trading concepts.',
   simple:
-    "I don't have an entry for that yet. The built-in knowledge base covers copy trading, liquidity, staking, EMBER, tokenomics, orders, charts, risk concepts and the platform's own features — try naming the concept, or connect a model through AI_MODEL_URL for open-ended answers.",
+    "I don't have an entry for that. I am Pyrus, your Prometheus trading buddy, and I only answer questions about trading, copy strategies, markets, and this platform. Please ask me about a trade, metric, chart, or concept on your screen!",
   howItWorks:
-    'Questions are matched against the curated entries by keyword; an unmatched question falls through to this reply rather than guessing.',
-  example: 'Try "what is impermanent loss", "how does copy trading work" or "what does Sentinel do".',
-  remember: 'Nothing here is invented: an entry either exists or this reply says it does not.',
+    'Questions outside of financial trading, copy trading books, and Prometheus platform features are declined so answers remain safe and relevant.',
+  example: 'Try "why was this trade short?", "how does copy trading work?", or "what is impermanent loss?".',
+  remember: 'Pyrus is a dedicated trading assistant, not a general-purpose chat bot.',
 };
 
 export interface MatchInput {
   query: string;
   /** Free text from the inspected element / visible page, if the widget sent any. */
   context?: string;
+}
+
+/** Whether the question is an element pointer without naming a concept. */
+const GENERIC_POINTER_WORDS = ['this', 'it', 'here', 'that', 'selected', 'component', 'element', 'part'];
+
+function isGenericPointer(query: string): boolean {
+  if (!query) return true;
+  const words = query.split(' ').filter(Boolean);
+  const hasPointer = words.some((w) => GENERIC_POINTER_WORDS.includes(w));
+  return hasPointer && words.length <= 5;
 }
 
 /**
@@ -317,15 +393,24 @@ export function matchKnowledgeEntry(input: MatchInput): KnowledgeEntry {
   const query = normalize(input.query ?? '');
   const context = normalize(input.context ?? '');
 
+  const generic = isGenericPointer(query);
+
   let best: KnowledgeEntry = FALLBACK_ENTRY;
   let bestScore = 0;
 
   for (const entry of KNOWLEDGE_BASE) {
-    let score = 0;
+    let queryScore = 0;
+    let contextScore = 0;
     for (const keyword of entry.keywords) {
-      if (mentions(query, keyword)) score += keyword.length * 3;
-      if (context && mentions(context, keyword)) score += keyword.length;
+      if (mentions(query, keyword)) queryScore += keyword.length * 3;
+      if (context && mentions(context, keyword)) contextScore += keyword.length;
     }
+
+    // Only allow context to score when the user specifically asks a generic
+    // pointer question (e.g. "explain this") or when the query itself matches keywords.
+    // An unrelated question (e.g. "who is ansar") must NEVER match simply because of page context.
+    const score = queryScore > 0 ? queryScore + contextScore : (generic ? contextScore : 0);
+
     if (score > bestScore) {
       best = entry;
       bestScore = score;

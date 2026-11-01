@@ -4,7 +4,13 @@ import { ConfigModule } from '@nestjs/config';
 import { AppConfig, createAppConfig } from './app.config';
 import { validateEnvironment } from './env.validation';
 
-export { AppConfig, AuthConfig, createAppConfig, resolvePem } from './app.config';
+export {
+  AppConfig,
+  AuthConfig,
+  createAppConfig,
+  resolvePem,
+  type ExchangeRevenueMode,
+} from './app.config';
 export { envValidationSchema, validateEnvironment, formatEnvValidationError } from './env.validation';
 
 /** Injection token for the validated, typed {@link AppConfig} instance. */

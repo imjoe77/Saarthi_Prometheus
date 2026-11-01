@@ -113,6 +113,9 @@ describe('USDT exchange (e2e)', () => {
     await resetLiquidityTables(prisma);
 
     if (createdUserIds.length > 0) {
+      // Module 08 x 11: every settled order now carries a revenue event that
+      // Restrict-references it, so the event goes before the order.
+      await prisma.exchangeRevenueEvent.deleteMany({ where: { userId: { in: createdUserIds } } });
       await prisma.usdtOrder.deleteMany({ where: { userId: { in: createdUserIds } } });
       await prisma.transaction.deleteMany({ where: { wallet: { userId: { in: createdUserIds } } } });
       await prisma.walletBalance.deleteMany({ where: { wallet: { userId: { in: createdUserIds } } } });

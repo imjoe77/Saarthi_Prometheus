@@ -1,8 +1,11 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { Prisma, type CopyAccount, type CopyEvent, type CopyPosition, type StrategyFollow } from '@prisma/client';
+import { Prisma, TransactionType, type CopyAccount, type CopyEvent, type CopyPosition, type StrategyFollow } from '@prisma/client';
 
 import { DomainException } from '../../common/errors/domain.exception';
 import { PrismaService } from '../../database/prisma.service';
+import { LiveDataService } from '../live-data/live-data.service';
+import { WalletService } from '../wallet/wallet.service';
+import { markPosition } from '../trading/domain/position-book';
 import {
   PAPER_EXECUTION_PORT,
   type PaperExecutionPort,
@@ -82,14 +85,36 @@ export interface CopyPerformanceRecord {
   points: PerformancePoint[];
 }
 
+/**
+ * One open copy holding, marked at the market.
+ *
+ * THE MARKS MAY BE NULL. A symbol the feed cannot price has no honest market
+ * value, so the value columns are null rather than zero - zero would claim the
+ * holding is worth nothing, which is a claim, not an absence.
+ */
+export interface MarkedCopyPosition {
+  readonly position: CopyPosition;
+  readonly markPrice: Prisma.Decimal | null;
+  readonly marketValue: Prisma.Decimal | null;
+  readonly unrealizedPnl: Prisma.Decimal | null;
+  readonly stale: boolean;
+}
+
 export interface CopyAggregateAccount {
   followCount: number;
   cash: Prisma.Decimal;
   realizedPnl: Prisma.Decimal;
+  /** The caller's real USDT balance, which gates whether a copy may happen. */
+  walletUsdt: Prisma.Decimal;
   positions: Array<{
     symbol: string;
+    direction: 'LONG' | 'SHORT';
     quantity: Prisma.Decimal;
     averageEntryPrice: Prisma.Decimal;
+    markPrice: Prisma.Decimal | null;
+    marketValue: Prisma.Decimal | null;
+    unrealizedPnl: Prisma.Decimal | null;
+    stale: boolean;
     followCount: number;
   }>;
 }
@@ -123,6 +148,8 @@ export class CopyService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly strategyService: StrategyService,
+    private readonly liveDataService: LiveDataService,
+    private readonly walletService: WalletService,
     @Inject(PAPER_EXECUTION_PORT) private readonly port: PaperExecutionPort,
   ) {}
 
@@ -361,14 +388,21 @@ export class CopyService {
    * "no answer yet is not a zero" rule the expert's paper account follows - so
    * a follow that has never copied reads as absent rather than as 100,000 that
    * nobody has touched.
+   *
+   * The positions are priced at the market, and the wallet balance comes
+   * along because it is the gate every further copy has to pass.
    */
   async getFollowAccount(
     followerId: string,
     strategyId: string,
-  ): Promise<{ account: CopyAccount | null; positions: CopyPosition[] }> {
+  ): Promise<{
+    account: CopyAccount | null;
+    positions: MarkedCopyPosition[];
+    walletUsdt: Prisma.Decimal;
+  }> {
     await this.getFollowWithStrategy(followerId, strategyId);
 
-    const [account, positions] = await Promise.all([
+    const [account, positions, walletUsdt] = await Promise.all([
       this.prisma.copyAccount.findUnique({
         where: { followerId_strategyId: { followerId, strategyId } },
       }),
@@ -376,9 +410,44 @@ export class CopyService {
         where: { followerId, strategyId },
         orderBy: [{ openedAt: 'asc' }, { symbol: 'asc' }],
       }),
+      this.walletService.getAvailableBalance(followerId, 'USDT'),
     ]);
 
-    return { account, positions };
+    const quotes = await this.quoteBySymbol(positions.map((position) => position.symbol));
+
+    const marked = positions.map((position) => {
+      const quote = quotes.get(position.symbol);
+      const markPrice = quote?.markPrice ?? null;
+
+      if (markPrice === null) {
+        return {
+          position,
+          markPrice: null,
+          marketValue: null,
+          unrealizedPnl: null,
+          stale: quote?.stale ?? false,
+        };
+      }
+
+      const result = markPosition(
+        {
+          direction: position.direction,
+          quantity: position.quantity,
+          averageEntryPrice: position.averageEntryPrice,
+        },
+        markPrice,
+      );
+
+      return {
+        position,
+        markPrice,
+        marketValue: result.marketValue,
+        unrealizedPnl: result.unrealizedPnl,
+        stale: quote?.stale ?? false,
+      };
+    });
+
+    return { account, positions: marked, walletUsdt };
   }
 
   /**
@@ -386,45 +455,134 @@ export class CopyService {
    *
    * Each follow holds its own pot, so this is an *aggregate of separate
    * balances*, not one pooled account - which is why `followCount` is part of
-   * the answer. Positions are merged per symbol with a quantity-weighted
-   * average entry, so the figure is the same number the per-follow rows would
-   * produce if they were one holding.
+   * the answer.
+   *
+   * POSITIONS MERGE PER SYMBOL *AND DIRECTION*. Two experts can disagree
+   * about the same instrument - one long, one short - and averaging those two
+   * into one "AAPL" row would produce a number that describes neither
+   * position. A long row and a short row are two facts about the book, and
+   * the aggregate keeps them apart.
+   *
+   * THE HOLDINGS ARE PRICED. Each row carries the quote it was marked at, its
+   * market value and its unrealised P&L, or nulls when the feed produced no
+   * price at all. A copy account that could only be read in units would leave
+   * the follower to value their own book, and a valuation nobody computes is
+   * a valuation nobody can check.
    */
   async getAggregateAccount(followerId: string): Promise<CopyAggregateAccount> {
-    const [accounts, positions, followCount] = await Promise.all([
+    const [accounts, positions, followCount, walletUsdt] = await Promise.all([
       this.prisma.copyAccount.findMany({ where: { followerId } }),
       this.prisma.copyPosition.findMany({ where: { followerId } }),
       this.prisma.strategyFollow.count({ where: { followerId } }),
+      this.walletService.getAvailableBalance(followerId, 'USDT'),
     ]);
 
-    const merged = new Map<string, { quantity: Prisma.Decimal; value: Prisma.Decimal; followCount: number }>();
+    const merged = new Map<
+      string,
+      {
+        symbol: string;
+        direction: 'LONG' | 'SHORT';
+        quantity: Prisma.Decimal;
+        value: Prisma.Decimal;
+        followCount: number;
+      }
+    >();
 
     for (const position of positions) {
-      const current = merged.get(position.symbol) ?? {
+      const key = `${position.symbol}|${position.direction}`;
+      const current = merged.get(key) ?? {
+        symbol: position.symbol,
+        direction: position.direction,
         quantity: new Prisma.Decimal(0),
         value: new Prisma.Decimal(0),
         followCount: 0,
       };
-      const quantity = current.quantity.plus(position.quantity);
+      current.quantity = current.quantity.plus(position.quantity);
       current.value = current.value.plus(position.quantity.times(position.averageEntryPrice));
-      current.quantity = quantity;
       current.followCount += 1;
-      merged.set(position.symbol, current);
+      merged.set(key, current);
     }
+
+    const rows = [...merged.values()].map((row) => ({
+      symbol: row.symbol,
+      direction: row.direction,
+      quantity: row.quantity,
+      averageEntryPrice: row.quantity.isZero()
+        ? new Prisma.Decimal(0)
+        : row.value.dividedBy(row.quantity),
+      followCount: row.followCount,
+    }));
+
+    const quotes = await this.quoteBySymbol(rows.map((row) => row.symbol));
 
     return {
       followCount,
       cash: accounts.reduce((sum, account) => sum.plus(account.cash), new Prisma.Decimal(0)),
       realizedPnl: accounts.reduce((sum, account) => sum.plus(account.realizedPnl), new Prisma.Decimal(0)),
-      positions: [...merged.entries()].map(([symbol, value]) => ({
-        symbol,
-        quantity: value.quantity,
-        averageEntryPrice: value.quantity.isZero()
-          ? new Prisma.Decimal(0)
-          : value.value.dividedBy(value.quantity),
-        followCount: value.followCount,
-      })),
+      walletUsdt,
+      positions: rows.map((row) => {
+        const quote = quotes.get(row.symbol);
+        const markPrice = quote?.markPrice ?? null;
+
+        if (markPrice === null) {
+          return {
+            ...row,
+            markPrice: null,
+            marketValue: null,
+            unrealizedPnl: null,
+            stale: quote?.stale ?? false,
+          };
+        }
+
+        const marked = markPosition(
+          {
+            direction: row.direction,
+            quantity: row.quantity,
+            averageEntryPrice: row.averageEntryPrice,
+          },
+          markPrice,
+        );
+
+        return {
+          ...row,
+          markPrice,
+          marketValue: marked.marketValue,
+          unrealizedPnl: marked.unrealizedPnl,
+          stale: quote?.stale ?? false,
+        };
+      }),
     };
+  }
+
+  /**
+   * The latest quote for each of the given symbols - one read per symbol, not
+   * one per position, so a book holding the same instrument in two directions
+   * still pays for a single quote.
+   *
+   * A symbol the feed cannot price is present in the map with a null price
+   * rather than absent, so a caller can tell "no price" from "not asked".
+   */
+  private async quoteBySymbol(
+    symbols: readonly string[],
+  ): Promise<Map<string, { markPrice: Prisma.Decimal | null; stale: boolean }>> {
+    const at = new Date();
+    const unique = [...new Set(symbols)];
+
+    const entries = await Promise.all(
+      unique.map(async (symbol) => {
+        const quote = await this.liveDataService.quote(symbol, at);
+
+        return [
+          symbol,
+          {
+            markPrice: quote.available && quote.price !== null ? new Prisma.Decimal(quote.price) : null,
+            stale: quote.stale,
+          },
+        ] as const;
+      }),
+    );
+
+    return new Map(entries);
   }
 
   /** Copied-order history for one follow, newest first. Includes refusals. */
@@ -803,6 +961,122 @@ export class CopyService {
     }
 
     return result;
+  }
+
+  /**
+   * Unlocks a direct chat consultation session with the expert behind a strategy.
+   * Costs 10 EMBER from the caller's wallet.
+   */
+  async connectExpert(
+    userId: string,
+    strategyId: string,
+  ): Promise<{
+    success: boolean;
+    strategyId: string;
+    strategyName: string;
+    fee: string;
+    asset: string;
+    remainingBalance: string;
+    unlockedAt: string;
+  }> {
+    const strategy = await this.prisma.strategy.findUnique({
+      where: { id: strategyId },
+    });
+
+    if (!strategy) {
+      throw DomainException.notFound('Strategy');
+    }
+
+    const REQUIRED_EMBER = new Prisma.Decimal(10);
+    const emberBalance = await this.walletService.getAvailableBalance(userId, 'EMBER');
+
+    if (emberBalance.lessThan(REQUIRED_EMBER)) {
+      throw DomainException.badRequest(
+        `Connecting with an expert requires 10 EMBER. Your current balance is ${emberBalance.toString()} EMBER. Please acquire EMBER from the EMBER Hub.`,
+      );
+    }
+
+    const wallet = await this.walletService.getForUserOrThrow(userId);
+    const emberAsset = await this.prisma.asset.findFirst({
+      where: { symbol: 'EMBER' },
+    });
+
+    if (emberAsset) {
+      await this.walletService.debit(
+        wallet.id,
+        emberAsset.id,
+        '10',
+        {
+          type: TransactionType.TRANSFER_OUT,
+          note: `Direct expert consultation unlock for strategy: ${strategy.name}`,
+        },
+      );
+    }
+
+    const remaining = emberBalance.minus(REQUIRED_EMBER);
+
+    return {
+      success: true,
+      strategyId: strategy.id,
+      strategyName: strategy.name,
+      fee: '10',
+      asset: 'EMBER',
+      remainingBalance: remaining.toString(),
+      unlockedAt: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * Responds to a naive trader's direct message to the expert behind a strategy.
+   */
+  async chatWithExpert(
+    userId: string,
+    strategyId: string,
+    message: string,
+  ): Promise<{
+    strategyId: string;
+    expertName: string;
+    reply: string;
+    timestamp: string;
+  }> {
+    const strategy = await this.prisma.strategy.findUnique({
+      where: { id: strategyId },
+    });
+
+    if (!strategy) {
+      throw DomainException.notFound('Strategy');
+    }
+
+    const reply = this.generateExpertReply(strategy.name, strategy.description, message);
+
+    return {
+      strategyId: strategy.id,
+      expertName: `Expert Trader (${strategy.name})`,
+      reply,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  private generateExpertReply(strategyName: string, description: string | null, message: string): string {
+    const query = message.toLowerCase();
+
+    if (query.includes('risk') || query.includes('stop loss') || query.includes('drawdown')) {
+      return `For "${strategyName}", I maintain a strict risk management framework. Every position is sized so that maximum risk does not exceed 1.5% to 2% of equity. If market momentum invalidates our key support/resistance levels, positions are trimmed or exited immediately to protect capital.`;
+    }
+
+    if (query.includes('allocation') || query.includes('size') || query.includes('how much') || query.includes('fraction')) {
+      return `If you're copying "${strategyName}", I suggest starting with an allocation fraction between 0.1 and 0.25 (10% to 25%). This allows you to experience the trade replication and market variance comfortably before scaling up your position size.`;
+    }
+
+    if (query.includes('why') || query.includes('trade') || query.includes('signal') || query.includes('enter') || query.includes('exit') || query.includes('short') || query.includes('long')) {
+      return `My entry and exit decisions on "${strategyName}" are based on confluence between order-flow liquidity depth, key trendline breakouts, and multi-timeframe volume confirmation. When we spot institutional accumulation, we enter early with tight stops and scale out as targets are reached.`;
+    }
+
+    if (query.includes('market') || query.includes('outlook') || query.includes('trend') || query.includes('crypto') || query.includes('btc')) {
+      return `Market structure currently shows elevated volatility. On "${strategyName}", we capitalize on high-probability intraday swings while avoiding holding through unpredictable macroeconomic announcements. Stay disciplined with your copy allocation!`;
+    }
+
+    return `Thanks for reaching out! Regarding "${strategyName}": our edge comes from systematic discipline, disciplined entries, and strict stop-loss rules. Feel free to ask me about our latest fills, risk limits, or market analysis!`;
   }
 
   private isUniqueConstraintViolation(error: unknown): boolean {

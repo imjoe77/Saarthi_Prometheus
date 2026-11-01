@@ -46,14 +46,14 @@
     var css = document.createElement('link');
     css.id = 'aiDoubtSolverStyles';
     css.rel = 'stylesheet';
-    css.href = basePath + 'ai-doubt-solver.css';
+    css.href = basePath + 'ai-doubt-solver.css?v=2';
     document.head.appendChild(css);
   }
 
   if (!window.__PrometheusAIDoubtSolverScriptLoaded) {
     window.__PrometheusAIDoubtSolverScriptLoaded = true;
     var js = document.createElement('script');
-    js.src = basePath + 'ai-doubt-solver.js';
+    js.src = basePath + 'ai-doubt-solver.js?v=2';
     js.async = true;
     document.body ? document.body.appendChild(js) : document.addEventListener('DOMContentLoaded', function () {
       document.body.appendChild(js);

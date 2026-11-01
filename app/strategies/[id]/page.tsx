@@ -4,11 +4,13 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import dynamic from "next/dynamic";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { AlertTriangle, ArrowLeft, Loader2, RefreshCw, Wifi, WifiOff } from "lucide-react";
+import { AlertTriangle, ArrowLeft, Flame, Loader2, RefreshCw, Wifi, WifiOff } from "lucide-react";
 
 import AppShell from "@/components/AppShell";
+import { ExpertChatModal } from "@/components/ExpertChatModal";
 import {
   ApiError,
+  closePaperPosition,
   followStrategy,
   getBars,
   getCopyFollowAccount,
@@ -137,8 +139,8 @@ const REJECT_REASON_LABEL: Record<string, string> = {
   MARKET_DATA_UNAVAILABLE: "No live quote was available for this instrument.",
   STALE_MARKET_DATA: "The quote was older than this instrument's freshness limit.",
   MARKET_CLOSED: "The market for this instrument is closed right now.",
-  INSUFFICIENT_PAPER_CASH: "The paper account does not hold enough cash for this buy.",
-  INSUFFICIENT_POSITION: "The paper account does not hold enough of this instrument to sell.",
+  INSUFFICIENT_PAPER_CASH: "The paper account does not hold enough cash for this order.",
+  INSUFFICIENT_WALLET_BALANCE: "Your USDT wallet balance does not cover this order's notional.",
 };
 
 /**
@@ -166,9 +168,9 @@ const COPY_ELIGIBILITY_LABEL: Record<string, string> = {
   STRATEGY_ARCHIVED: "The strategy is archived, so nothing is copied.",
   STRATEGY_NOT_ELIGIBLE: "The strategy is not publicly copyable, so nothing is copied.",
   ALLOCATION_ROUNDED_TO_ZERO: "The next order would round to zero at this allocation.",
-  INSUFFICIENT_COPY_CASH: "No copy cash is available for the next buy.",
-  INSUFFICIENT_POSITION: "Nothing is held to sell.",
+  INSUFFICIENT_COPY_CASH: "No copy cash is available for the next order.",
   PRICE_UNAVAILABLE: "The last expert fill had no usable price.",
+  INSUFFICIENT_WALLET_BALANCE: "Your USDT wallet balance does not cover the next copy.",
 };
 
 /** Why one line in the copy history was refused. */
@@ -177,9 +179,9 @@ const COPY_REJECT_REASON_LABEL: Record<string, string> = {
   STRATEGY_ARCHIVED: "The strategy was archived when this fill committed.",
   STRATEGY_NOT_ELIGIBLE: "The strategy was not publicly copyable when this fill committed.",
   ALLOCATION_ROUNDED_TO_ZERO: "The allocation rounded this order to zero.",
-  INSUFFICIENT_COPY_CASH: "No copy cash was available to buy with.",
-  INSUFFICIENT_POSITION: "The copy account held nothing of this symbol to sell.",
+  INSUFFICIENT_COPY_CASH: "No copy cash was available to spend.",
   PRICE_UNAVAILABLE: "The expert fill had no usable price.",
+  INSUFFICIENT_WALLET_BALANCE: "Your USDT wallet balance did not cover this copy.",
 };
 
 /* -------------------------------------------------------------------------- */
@@ -197,6 +199,7 @@ export default function StrategyDetailPage() {
   const [instruments, setInstruments] = useState<InstrumentDto[]>([]);
   const [instrumentsError, setInstrumentsError] = useState<string | null>(null);
   const [symbol, setSymbol] = useState("");
+  const [expertChatOpen, setExpertChatOpen] = useState(false);
 
   const [feed, setFeed] = useState<FeedStatusDto | null>(null);
 
@@ -216,7 +219,7 @@ export default function StrategyDetailPage() {
   const [orders, setOrders] = useState<PaperOrderResponse[]>([]);
   const [ordersError, setOrdersError] = useState<string | null>(null);
 
-  const [side, setSide] = useState<"BUY" | "SELL">("BUY");
+  const [side, setSide] = useState<"LONG" | "SHORT">("LONG");
   const [quantity, setQuantity] = useState("1");
   const [submitting, setSubmitting] = useState(false);
   const [lastOrder, setLastOrder] = useState<PaperOrderResponse | null>(null);
@@ -462,6 +465,32 @@ export default function StrategyDetailPage() {
   }, [strategyId]);
 
   /**
+   * Re-reads only the paper account, so the open positions can be marked
+   * against a market that has moved since the last read. The blotter is not
+   * re-read: it changes only when an order is placed, and the poll would
+   * rewrite the same rows every fifteen seconds.
+   */
+  const refreshMarks = useCallback(() => {
+    void getPaperSummary(strategyId)
+      .then((summary) => {
+        setPaper(summary);
+        setPaperError(null);
+        setPaperForbidden(false);
+      })
+      .catch((error: unknown) => {
+        if (
+          error instanceof ApiError &&
+          error.status === 404
+        ) {
+          setPaper(null);
+          setPaperForbidden(true);
+          return;
+        }
+        setPaperError(messageFor(error));
+      });
+  }, [strategyId]);
+
+  /**
    * Re-reads the follow, its account and its copy history together.
    *
    * The prologue is deferred a microtask deliberately: the rule this codebase
@@ -528,17 +557,22 @@ export default function StrategyDetailPage() {
   }, [refreshCopy]);
 
   /**
-   * Quote polling only. The chart is not polled on a timer: a candle series that
-   * re-shuffles every few seconds makes it impossible to read a pattern, and the
-   * timeframe buttons already re-read the series when the user asks.
+   * Quote polling, and with it the marks. The chart is not polled on a timer: a
+   * candle series that re-shuffles every few seconds makes it impossible to
+   * read a pattern, and the timeframe buttons already re-read the series when
+   * the user asks. The paper account IS re-read, because an open position's
+   * unrealised P&L is only live if the price it was marked at is re-read.
    */
   useEffect(() => {
-    if (!symbol) return;
+    // The paper account is owner-scoped, so there is nothing to mark for a
+    // strategy that belongs to somebody else.
+    if (!symbol || paper === null) return;
     const timer = setInterval(() => {
       void refreshQuote();
+      refreshMarks();
     }, QUOTE_POLL_MS);
     return () => clearInterval(timer);
-  }, [symbol, refreshQuote]);
+  }, [paper, symbol, refreshMarks, refreshQuote]);
 
   const submitOrder = useCallback(
     async (event: React.FormEvent<HTMLFormElement>) => {
@@ -572,6 +606,28 @@ export default function StrategyDetailPage() {
     [quantity, refreshPaper, side, strategyId, symbol],
   );
 
+  /**
+   * Closes an open position at the live market price.
+   *
+   * THE CLOSE IS AN ORDER, NOT A SPECIAL CASE. It goes through the same engine,
+   * the same price rules and the same wallet gate as any other order, with the
+   * direction reversed and the quantity taken from the position itself - so a
+   * close cannot fill at a price the ticker would not have produced.
+   */
+  const closePosition = useCallback(
+    async (symbol: string) => {
+      setSubmitError(null);
+      try {
+        const result = await closePaperPosition(strategyId, symbol);
+        setLastOrder(result);
+        refreshPaper();
+      } catch (error: unknown) {
+        setSubmitError(messageFor(error));
+      }
+    },
+    [refreshPaper, strategyId],
+  );
+
   const feedTone = useMemo(() => {
     if (!feed) return { label: "CHECKING FEED", tone: "text-[#8E98A8]", border: "border-[#2C3748]" };
     if (feed.provider === "alpaca" && feed.enabled) {
@@ -584,6 +640,40 @@ export default function StrategyDetailPage() {
   }, [feed]);
 
   const instrument = instruments.find((item) => item.symbol === symbol) ?? null;
+
+  /**
+   * The price this order would reference: a LONG pays the ask, a SHORT hits the
+   * bid. It is an estimate and is labelled as one - the server prices the order
+   * itself when it commits it.
+   */
+  const referencePrice = useMemo(() => {
+    if (!quote || !quote.available) return null;
+    const raw = side === "LONG" ? quote.ask : quote.bid;
+    if (!raw) return null;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? parsed : null;
+  }, [quote, side]);
+
+  /** What the order would cost, at the reference price. Null when it cannot be computed. */
+  const estimatedNotional = useMemo(() => {
+    if (referencePrice === null) return null;
+    if (quantityError(quantity) !== null) return null;
+    const parsed = Number(quantity) * referencePrice;
+    return Number.isFinite(parsed) ? parsed : null;
+  }, [quantity, referencePrice]);
+
+  /**
+   * Whether the trader's real USDT covers this order.
+   *
+   * THE CHECK IS ADVISORY; THE SERVER IS THE AUTHORITY. The balance is a live
+   * figure and the price moves between this render and the commit, so the
+   * screen says what it sees and lets the server decide - it refuses the order
+   * and records the refusal.
+   */
+  const walletShort = useMemo(() => {
+    if (!paper || estimatedNotional === null) return false;
+    return Number(paper.walletUsdt) < estimatedNotional;
+  }, [estimatedNotional, paper]);
 
   /**
    * Whether this is the caller's own strategy, read from the paper panel's
@@ -640,6 +730,16 @@ export default function StrategyDetailPage() {
               <span className="px-2 py-0.5 rounded border text-[10px] font-mono font-bold bg-[#5D6B82]/10 text-[#8E98A8] border-[#2C3748]">
                 {strategy.visibility}
               </span>
+              <button
+                type="button"
+                onClick={() => setExpertChatOpen(true)}
+                className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#FF5A1F]/15 hover:bg-[#FF5A1F]/25 border border-[#FF5A1F]/40 text-xs font-bold text-[#FF5A1F] transition-all ml-1 shadow-sm"
+                title="Direct consultation with this expert trader (10 EMBER)"
+              >
+                <Flame className="w-3.5 h-3.5 text-[#FF5A1F]" />
+                <span>Chat with Expert</span>
+                <span className="px-1.5 py-0.5 bg-[#FF5A1F]/25 rounded text-[10px] font-mono">10 EMBER</span>
+              </button>
             </div>
             {strategy.description && (
               <p className="text-xs text-[#7B8799] mt-1.5 max-w-3xl leading-relaxed">
@@ -818,12 +918,12 @@ export default function StrategyDetailPage() {
               <div>
                 <h2 className="text-sm font-bold text-white tracking-tight">Paper order</h2>
                 <p className="text-[11px] text-[#717E91] mt-0.5">
-                  Market order, long-only, simulated. The server picks the price.
+                  Market order, LONG or SHORT, simulated. The server picks the price.
                 </p>
               </div>
 
               <div className="grid grid-cols-2 gap-2">
-                {(["BUY", "SELL"] as const).map((option) => (
+                {(["LONG", "SHORT"] as const).map((option) => (
                   <button
                     key={option}
                     type="button"
@@ -833,7 +933,7 @@ export default function StrategyDetailPage() {
                     }}
                     className={`py-2.5 rounded-lg text-xs font-bold border transition-colors ${
                       side === option
-                        ? option === "BUY"
+                        ? option === "LONG"
                           ? "bg-[#00D26A]/12 text-[#00D26A] border-[#00D26A]/40"
                           : "bg-[#FF4D4D]/12 text-[#FF4D4D] border-[#FF4D4D]/40"
                         : "bg-[#0E1219] text-[#717E91] border-[#242C3A] hover:text-white"
@@ -843,6 +943,12 @@ export default function StrategyDetailPage() {
                   </button>
                 ))}
               </div>
+
+              <p className="text-[10px] font-mono leading-relaxed text-[#5D6B82]">
+                A LONG spends cash and opens or adds to a long position. A SHORT brings the notional
+                in and opens or adds to a short. Either way the position you face is reduced, closed
+                or flipped.
+              </p>
 
               <label className="block">
                 <span className="block text-[10px] font-mono uppercase tracking-wider text-[#6E7B8E] mb-1.5">
@@ -880,21 +986,54 @@ export default function StrategyDetailPage() {
                 )}
               </label>
 
-              {quote && quote.available && (side === "BUY" ? quote.ask : quote.bid) && (
+              {quote && quote.available && referencePrice !== null && (
                 <div className="rounded-lg bg-[#0E1219] border border-[#1E2532] px-3 py-2.5 space-y-1.5">
                   <Row
-                    label={side === "BUY" ? "Reference price (ask)" : "Reference price (bid)"}
-                    value={money(side === "BUY" ? quote.ask : quote.bid, 4)}
+                    label={side === "LONG" ? "Reference price (ask)" : "Reference price (bid)"}
+                    value={money(String(referencePrice), 4)}
                   />
                   {quantityError(quantity) === null && (
                     <Row
                       label="Estimated notional"
                       value={`$${money(
-                        (Number(quantity) * Number(side === "BUY" ? quote.ask : quote.bid)).toFixed(4),
+                        (Number(quantity) * referencePrice).toFixed(4),
                         2,
                       )}`}
                       muted
                     />
+                  )}
+                </div>
+              )}
+
+              {/*
+                THE WALLET IS A GATE, NOT A DEBIT. The balance shown here is the
+                trader's real USDT, and the server refuses an order whose
+                notional it does not cover. Paper trading never spends that
+                money - it only has to be there.
+              */}
+              {paper && (
+                <div
+                  className={`rounded-lg border px-3 py-2.5 space-y-1.5 ${
+                    walletShort ? "border-[#FF4D4D]/40 bg-[#FF4D4D]/5" : "border-[#1E2532] bg-[#0E1219]"
+                  }`}
+                >
+                  <Row
+                    label="Wallet USDT (real)"
+                    value={`$${money(paper.walletUsdt, 2)}`}
+                    tone={walletShort ? "text-[#FF4D4D]" : undefined}
+                  />
+                  {estimatedNotional !== null && (
+                    <Row
+                      label="This order needs"
+                      value={`$${money(String(estimatedNotional), 2)}`}
+                      muted
+                    />
+                  )}
+                  {walletShort && (
+                    <p className="text-[10px] font-mono leading-relaxed text-[#FFB3B3] pt-0.5">
+                      Your USDT balance does not cover this order&apos;s notional, so the server
+                      will record it as refused.
+                    </p>
                   )}
                 </div>
               )}
@@ -927,8 +1066,8 @@ export default function StrategyDetailPage() {
               paper={paper}
               error={paperError}
               forbidden={paperForbidden}
-              quote={quote}
               onRetry={refreshPaper}
+              onClose={closePosition}
             />
 
             <CopyPanel
@@ -943,6 +1082,13 @@ export default function StrategyDetailPage() {
             />
           </aside>
         </div>
+
+        <ExpertChatModal
+          strategyId={strategyId}
+          strategyName={strategy.name}
+          isOpen={expertChatOpen}
+          onClose={() => setExpertChatOpen(false)}
+        />
       </div>
     </AppShell>
   );
@@ -1102,6 +1248,13 @@ function OrderResult({ order }: { order: PaperOrderResponse }) {
       </div>
       <Row label="Order" value={`${order.side} ${order.quantity} ${order.symbol}`} />
       {order.fillPrice && <Row label="Filled at" value={money(order.fillPrice, 4)} />}
+      {order.realizedPnl !== null && order.realizedPnl !== undefined && (
+        <Row
+          label="Realized P&L"
+          value={formatSigned(order.realizedPnl)}
+          tone={signTone(order.realizedPnl)}
+        />
+      )}
       {!filled && order.rejectReason && (
         <p className="text-[11px] text-[#C5CFDE] leading-relaxed pt-0.5">
           {REJECT_REASON_LABEL[order.rejectReason] ?? order.rejectReason}
@@ -1114,24 +1267,30 @@ function OrderResult({ order }: { order: PaperOrderResponse }) {
 /**
  * Cash, realized P&L and open positions.
  *
- * POSITION VALUE IS A MARK, AND SAYS SO. Market value and unrealised P&L are
- * computed against the quote this screen already holds. They are labelled as a
- * mark because the ledger does not store them - a value that looks measured but
- * was computed in the browser must never present itself as a recorded result.
+ * THE MARKS COME FROM THE SERVER. Market value and unrealised P&L are priced
+ * against the market by the ledger's own read, and a screen that recomputed
+ * them in the browser could disagree with the number the engine acted on. A
+ * null mark means the feed had no price for that instrument - never zero.
+ *
+ * A POSITION POINTS ONE WAY. The direction is part of the holding: "2 SOL" is
+ * not a fact on its own, it is "2 SOL long" or "2 SOL short", and the two have
+ * opposite exposure to the same price.
  */
 function AccountPanel({
   paper,
   error,
   forbidden,
-  quote,
   onRetry,
+  onClose,
 }: {
   paper: PaperSummaryDto | null;
   error: string | null;
   forbidden: boolean;
-  quote: QuoteDto | null;
   onRetry: () => void;
+  onClose: (symbol: string) => void;
 }) {
+  const [closing, setClosing] = useState<string | null>(null);
+
   if (forbidden) {
     return (
       <div className="bg-[#12161E] border border-[#202735] rounded-xl p-4">
@@ -1159,8 +1318,6 @@ function AccountPanel({
     );
   }
 
-  const markPrice = quote?.available && quote.price ? Number(quote.price) : null;
-
   return (
     <div className="bg-[#12161E] border border-[#202735] rounded-xl p-4 space-y-3.5">
       <div className="flex items-baseline justify-between">
@@ -1177,13 +1334,21 @@ function AccountPanel({
         <div className="rounded-lg bg-[#0E1219] border border-[#1E2532] px-3 py-2.5 space-y-1.5">
           <Row label="Cash" value={`$${money(paper.account.cash)}`} />
           <Row
-            label="Realized P&L (closed sells)"
+            label="Realized P&L (closed positions)"
             value={formatSigned(paper.account.realizedPnl)}
             tone={signTone(paper.account.realizedPnl)}
           />
           <Row label="Opened" value={clockOf(paper.account.openedAt)} muted />
         </div>
       )}
+
+      <div className="rounded-lg bg-[#0E1219] border border-[#1E2532] px-3 py-2.5 space-y-1.5">
+        <Row label="Wallet USDT (real)" value={`$${money(paper.walletUsdt, 2)}`} />
+        <p className="text-[10px] font-mono leading-relaxed text-[#5D6B82] pt-0.5">
+          A gate, not a debit: your order&apos;s notional has to be covered by this balance, and
+          the simulated paper cash above is what the trade actually spends.
+        </p>
+      </div>
 
       <div>
         <p className="text-[10px] font-mono uppercase tracking-wider text-[#6E7B8E] mb-2">
@@ -1196,32 +1361,62 @@ function AccountPanel({
         ) : (
           <div className="space-y-2">
             {paper.positions.map((position) => {
-              const canMark = position.symbol === quote?.symbol && markPrice !== null;
-              const value = canMark ? Number(position.quantity) * markPrice : null;
-              const cost = Number(position.quantity) * Number(position.averageEntryPrice);
-              const unrealised = value === null ? null : value - cost;
+              const isLong = position.direction === "LONG";
 
               return (
-                <div key={position.symbol} className="rounded-lg bg-[#0E1219] border border-[#1E2532] px-3 py-2.5 space-y-1.5">
-                  <div className="flex items-center justify-between">
+                <div
+                  key={position.symbol}
+                  className="rounded-lg bg-[#0E1219] border border-[#1E2532] px-3 py-2.5 space-y-1.5"
+                >
+                  <div className="flex items-center justify-between gap-2">
                     <span className="text-xs font-bold text-white">{position.symbol}</span>
-                    <span className="text-xs font-mono text-[#A6B2C4]">{money(position.quantity, 8)}</span>
+                    <span
+                      className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-bold border ${
+                        isLong
+                          ? "bg-[#00D26A]/10 text-[#00D26A] border-[#00D26A]/40"
+                          : "bg-[#FF4D4D]/10 text-[#FF4D4D] border-[#FF4D4D]/40"
+                      }`}
+                    >
+                      {position.direction}
+                    </span>
                   </div>
+                  <Row label="Quantity" value={money(position.quantity, 8)} />
                   <Row label="Avg entry" value={money(position.averageEntryPrice, 4)} />
                   <Row
-                    label={canMark ? "Market value (mark)" : "Market value"}
-                    value={value === null ? "—" : `$${money(String(value))}`}
-                    muted={!canMark}
+                    label={position.markPrice === null ? "Mark price" : "Mark price (live)"}
+                    value={position.markPrice === null ? "—" : money(position.markPrice, 4)}
+                    muted={position.markPrice === null}
                   />
-                  {unrealised !== null ? (
-                    <Row
-                      label="Unrealised P&L (mark)"
-                      value={formatSigned(String(unrealised))}
-                      tone={signTone(String(unrealised))}
-                    />
-                  ) : (
+                  <Row
+                    label="Market value"
+                    value={position.marketValue === null ? "—" : formatSigned(position.marketValue)}
+                    muted={position.marketValue === null}
+                  />
+                  {position.unrealizedPnl === null ? (
                     <Row label="Unrealised P&L" value="—" muted />
+                  ) : (
+                    <Row
+                      label="Unrealised P&L"
+                      value={formatSigned(position.unrealizedPnl)}
+                      tone={signTone(position.unrealizedPnl)}
+                    />
                   )}
+                  {position.stale && (
+                    <p className="text-[10px] font-mono text-[#F5A623] pt-0.5">
+                      The quote this was marked at is behind the market.
+                    </p>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setClosing(position.symbol);
+                      onClose(position.symbol);
+                    }}
+                    disabled={closing !== null}
+                    className="w-full mt-1 py-1.5 rounded-lg bg-[#161B24] hover:bg-[#202735] border border-[#273242] disabled:opacity-50 text-[10px] font-mono font-bold tracking-wider text-white transition-colors"
+                  >
+                    {closing === position.symbol ? "CLOSING…" : "CLOSE POSITION"}
+                  </button>
                 </div>
               );
             })}
@@ -1267,7 +1462,7 @@ function OrdersPanel({
           <table className="w-full text-left">
             <thead>
               <tr className="border-b border-[#1E2532]">
-                {["Time", "Side", "Symbol", "Qty", "Price", "Status"].map((head) => (
+                {["Time", "Side", "Symbol", "Qty", "Price", "Realized", "Status"].map((head) => (
                   <th
                     key={head}
                     className="text-[10px] font-mono uppercase tracking-wider text-[#6E7B8E] pb-2 pr-3 font-medium"
@@ -1285,7 +1480,7 @@ function OrdersPanel({
                   </td>
                   <td
                     className={`py-2 pr-3 text-[11px] font-mono font-bold ${
-                      order.side === "BUY" ? "text-[#00D26A]" : "text-[#FF4D4D]"
+                      order.side === "LONG" ? "text-[#00D26A]" : "text-[#FF4D4D]"
                     }`}
                   >
                     {order.side}
@@ -1298,6 +1493,15 @@ function OrdersPanel({
                   </td>
                   <td className="py-2 pr-3 text-[11px] font-mono text-[#A6B2C4] whitespace-nowrap">
                     {order.fillPrice ? money(order.fillPrice, 4) : "—"}
+                  </td>
+                  <td
+                    className={`py-2 pr-3 text-[11px] font-mono whitespace-nowrap ${
+                      order.realizedPnl === null
+                        ? "text-[#8E98A8]"
+                        : signTone(order.realizedPnl) ?? "text-white"
+                    }`}
+                  >
+                    {order.realizedPnl === null ? "—" : formatSigned(order.realizedPnl)}
                   </td>
                   <td className="py-2 text-[11px] font-mono whitespace-nowrap">
                     {order.status === "FILLED" ? (
@@ -1820,7 +2024,7 @@ function CopyHistoryPanel({
                   </td>
                   <td
                     className={`py-2 pr-3 text-[11px] font-mono font-bold ${
-                      event.side === "BUY" ? "text-[#00D26A]" : "text-[#FF4D4D]"
+                      event.side === "LONG" ? "text-[#00D26A]" : "text-[#FF4D4D]"
                     }`}
                   >
                     {event.side}

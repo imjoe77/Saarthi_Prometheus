@@ -538,7 +538,7 @@ export async function getBars(
 export interface PaperOrderRequest {
   clientRequestId: string;
   symbol: string;
-  side: "BUY" | "SELL";
+  side: "LONG" | "SHORT";
   quantity: string;
 }
 
@@ -546,11 +546,13 @@ export interface PaperOrderResponse {
   orderId: string;
   strategyId: string;
   symbol: string;
-  side: string;
+  side: "LONG" | "SHORT";
   quantity: string;
   status: "FILLED" | "REJECTED";
   rejectReason: string | null;
   fillPrice: string | null;
+  /** Realised by this fill against the position it reduced. Null when it realised nothing. */
+  realizedPnl: string | null;
   placedAt: string;
   filledAt: string | null;
   clientRequestId: string;
@@ -569,6 +571,27 @@ export async function placePaperOrder(
   );
 }
 
+/**
+ * Closes an open position at the live market price.
+ *
+ * The close is an ordinary order in the opposite direction at the position's
+ * own quantity, so it fills under the same price and wallet rules as any other
+ * order. A strategy that holds nothing for the symbol answers 404.
+ */
+export async function closePaperPosition(
+  strategyId: string,
+  symbol: string,
+): Promise<PaperOrderResponse> {
+  return request<PaperOrderResponse>(
+    "strategies/" +
+      encodeURIComponent(strategyId) +
+      "/paper/positions/" +
+      encodeURIComponent(symbol) +
+      "/close",
+    { method: "POST" },
+  );
+}
+
 export async function listPaperOrders(strategyId: string): Promise<PaperOrderResponse[]> {
   return request<PaperOrderResponse[]>(
     "strategies/" + encodeURIComponent(strategyId) + "/paper/orders",
@@ -579,11 +602,24 @@ export async function listPaperOrders(strategyId: string): Promise<PaperOrderRes
 // The paper cash account and open positions behind the expert's account panel.
 // ---------------------------------------------------------------------------
 
-/** One open paper holding. Quantity and price are exact decimal strings. */
+/**
+ * One open paper holding, priced at the market.
+ *
+ * `direction` says which way the holding points and `quantity` is its
+ * magnitude, always greater than zero. The three marked figures are null
+ * together: without a price there is no market value and no unrealised P&L,
+ * and a zero would claim the position is worth nothing rather than that it
+ * could not be priced.
+ */
 export interface PaperPositionDto {
   symbol: string;
+  direction: "LONG" | "SHORT";
   quantity: string;
   averageEntryPrice: string;
+  markPrice: string | null;
+  marketValue: string | null;
+  unrealizedPnl: string | null;
+  stale: boolean;
   openedAt: string;
   lastActivityAt: string;
 }
@@ -591,10 +627,8 @@ export interface PaperPositionDto {
 /**
  * The paper cash account for one strategy.
  *
- * `realizedPnl` is the ledger figure for *closed* SELLs only. There is no
- * unrealised P&L here on purpose: marking a position to a live quote is the
- * screen's job, and it must label the result as a mark rather than as a
- * recorded result.
+ * `realizedPnl` is the ledger figure for closed positions only. There is no
+ * unrealised P&L here on purpose: it lives on the positions, where the mark is.
  */
 export interface PaperAccountDto {
   currency: string;
@@ -608,10 +642,15 @@ export interface PaperAccountDto {
  * `account` is null until the first order provisions the paper account. That is
  * a legitimate answer, not an error, and a screen that treats it as one would
  * show a scary banner to every user who has simply not traded yet.
+ *
+ * `walletUsdt` is the trader's real USDT balance - the capital gate every
+ * order's notional has to be covered by. It is a gate and not a debit: paper
+ * trading is simulated and never spends real ledger money.
  */
 export interface PaperSummaryDto {
   account: PaperAccountDto | null;
   positions: PaperPositionDto[];
+  walletUsdt: string;
 }
 
 export async function getPaperSummary(strategyId: string): Promise<PaperSummaryDto> {
@@ -638,8 +677,8 @@ export type CopyEligibility =
   | "STRATEGY_NOT_ELIGIBLE"
   | "ALLOCATION_ROUNDED_TO_ZERO"
   | "INSUFFICIENT_COPY_CASH"
-  | "INSUFFICIENT_POSITION"
-  | "PRICE_UNAVAILABLE";
+  | "PRICE_UNAVAILABLE"
+  | "INSUFFICIENT_WALLET_BALANCE";
 
 export type CopyRejectReason = Exclude<CopyEligibility, "ELIGIBLE">;
 
@@ -694,7 +733,7 @@ export interface CopyEvent {
   strategyName: string;
   expertOrderId: string;
   symbol: string;
-  side: "BUY" | "SELL";
+  side: "LONG" | "SHORT";
   expertQuantity: string;
   expertFillPrice: string | null;
   expertFilledAt: string;
@@ -702,6 +741,8 @@ export interface CopyEvent {
   quantity: string | null;
   fillPrice: string | null;
   gross: string | null;
+  /** Realised by this copy against the position it reduced. Null when it realised nothing. */
+  realizedPnl: string | null;
   status: "COPIED" | "REJECTED";
   rejectReason: CopyRejectReason | null;
   processedAt: string;
@@ -727,17 +768,30 @@ export interface CopyAccount {
   lastActivityAt: string;
 }
 
+/** One open copy holding: a direction, a magnitude, and the mark it was priced at. */
 export interface CopyPosition {
   symbol: string;
+  direction: "LONG" | "SHORT";
   quantity: string;
   averageEntryPrice: string;
+  markPrice: string | null;
+  marketValue: string | null;
+  unrealizedPnl: string | null;
+  stale: boolean;
   openedAt: string;
   lastActivityAt: string;
 }
 
+/**
+ * One follow's copy money.
+ *
+ * `walletUsdt` is the caller's real, spendable USDT balance - the gate every
+ * further copy has to pass. The copy pot is simulated and separate from it.
+ */
 export interface CopyFollowAccount {
   account: CopyAccount | null;
   positions: CopyPosition[];
+  walletUsdt: string;
 }
 
 /** A sum of separate pots, not one pooled balance - hence `followCount`. */
@@ -745,10 +799,16 @@ export interface CopyAggregateAccount {
   followCount: number;
   cash: string;
   realizedPnl: string;
+  walletUsdt: string;
   positions: Array<{
     symbol: string;
+    direction: "LONG" | "SHORT";
     quantity: string;
     averageEntryPrice: string;
+    markPrice: string | null;
+    marketValue: string | null;
+    unrealizedPnl: string | null;
+    stale: boolean;
     followCount: number;
   }>;
 }
@@ -943,6 +1003,45 @@ export async function listStrategyFollowers(
   );
 }
 
+export interface ConnectExpertResult {
+  success: boolean;
+  strategyId: string;
+  strategyName: string;
+  fee: string;
+  asset: string;
+  remainingBalance: string;
+  unlockedAt: string;
+}
+
+export interface ExpertChatResult {
+  strategyId: string;
+  expertName: string;
+  reply: string;
+  timestamp: string;
+}
+
+/** Directly connects and unlocks 1-on-1 consultation with an expert trader for 10 EMBER. */
+export async function connectExpertTrader(strategyId: string): Promise<ConnectExpertResult> {
+  return request<ConnectExpertResult>(
+    "copy/strategies/" + encodeURIComponent(strategyId) + "/connect-expert",
+    { method: "POST" },
+  );
+}
+
+/** Sends a message to the expert trader in an unlocked consultation session. */
+export async function sendExpertChatMessage(
+  strategyId: string,
+  message: string,
+): Promise<ExpertChatResult> {
+  return request<ExpertChatResult>(
+    "copy/strategies/" + encodeURIComponent(strategyId) + "/expert-chat",
+    {
+      method: "POST",
+      body: JSON.stringify({ message }),
+    },
+  );
+}
+
 // ---------------------------------------------------------------------------
 // MODULE 11 - EMBER tokenomics
 // ---------------------------------------------------------------------------
@@ -1120,6 +1219,151 @@ export async function getTokenomicsRecords(): Promise<TokenomicsRecords> {
 /** MODULE 10 — EMBER supply derived from the ledger, read-only. */
 export async function getEmberSupply(): Promise<EmberSupply> {
   return request<EmberSupply>("ember/supply");
+}
+
+// ---------------------------------------------------------------------------
+// MODULE 08 x MODULE 11 - settled USDT orders feeding the buyback & burn engine.
+// ---------------------------------------------------------------------------
+
+/**
+ * Why an order has the status it has — the backend's `EXCHANGE_REVENUE_REASON`
+ * set, mirrored. A blank would be indistinguishable from a bug, so every row
+ * carries one, including the reasons nothing was allocated.
+ */
+export type ExchangeRevenueReason =
+  | "ATTRIBUTED"
+  | "VOLUME_SIZED"
+  | "SELL_OUT_OF_SCOPE"
+  | "LEGACY_NO_LP_BACKING"
+  | "POLICY_DISABLED"
+  | "POLICY_RATE_ZERO"
+  | "NO_RETAINED_MARGIN"
+  | "BELOW_INR_SCALE"
+  | "PIPELINE_COMPLETED"
+  | "TREASURY_RESERVE_FLOOR"
+  | "TREASURY_INSUFFICIENT_BALANCE"
+  | "RETRY_SCHEDULED"
+  | "RETRIES_EXHAUSTED"
+  | "POLICY_ERROR";
+
+export type ExchangeRevenueStatus =
+  | "INELIGIBLE"
+  | "PENDING"
+  | "PROCESSING"
+  | "COMPLETED"
+  | "BLOCKED"
+  | "FAILED";
+
+/** `NOT_REQUIRED` means the ledger recorded the burn and the chain never saw it. */
+export type OnChainBurnState = "NOT_REQUIRED" | "PENDING" | "SUBMITTED" | "CONFIRMED" | "FAILED";
+
+export interface ExchangeRevenueBurnRef {
+  burnId: string;
+  amount: string;
+  onChainStatus: OnChainBurnState;
+  onChainTxHash: string | null;
+}
+
+/** The split Module 11 actually applied to one order, read off its allocation row. */
+export interface ExchangeRevenueAllocationRef {
+  allocationId: string;
+  directBurnPct: number;
+  buybackPct: number;
+  directBurnEmber: string;
+  buybackEmber: string;
+}
+
+export interface ExchangeRevenueEventRecord {
+  eventId: string;
+  orderId: string;
+  userId: string;
+  side: string;
+  status: ExchangeRevenueStatus;
+  reasonCode: ExchangeRevenueReason;
+  detail: string | null;
+  customerInr: string;
+  lpInrSettled: string;
+  retainedInr: string;
+  /** INR the platform earned from this order. Zero under a volume basis. */
+  revenueInr: string;
+  /**
+   * INR the burn engine was sized against. Equals `revenueInr` under
+   * RETAINED_BPS and the order's own value under VOLUME_LINKED — which is the
+   * whole difference between turnover and income, so the page shows both.
+   */
+  basisInr: string;
+  revenueMode: string;
+  revenueBps: number;
+  emberPrice: string;
+  directBurnPct: number;
+  buybackPct: number;
+  attempts: number;
+  maxAttempts: number;
+  detectedAt: string;
+  processedAt: string | null;
+  allocationId: string | null;
+  allocation: ExchangeRevenueAllocationRef | null;
+  buybackId: string | null;
+  /** SIMULATED or RECORDED_SIMULATED_EXECUTION. Neither says EMBER was bought. */
+  buybackStatus: "SIMULATED" | "RECORDED_SIMULATED_EXECUTION" | null;
+  buybackExecutedEmber: string | null;
+  directBurn: ExchangeRevenueBurnRef | null;
+  buybackBurn: ExchangeRevenueBurnRef | null;
+}
+
+export interface ExchangeRevenueSummary {
+  policy: {
+    mode: "NONE" | "RETAINED_BPS" | "VOLUME_LINKED";
+    bps: number;
+    baselineDirectBurnPct: number;
+    baselineBuybackPct: number;
+    emberPrice: string;
+    workerEnabled: boolean;
+    splitIsAdaptive: boolean;
+  };
+  totals: {
+    ordersSeen: number;
+    revenueInr: string;
+    /** What the engine was sized against in total — see `basisInr` per event. */
+    basisInr: string;
+    customerInr: string;
+    retainedInr: string;
+    eligibleOrders: number;
+    allocationsRecorded: number;
+    allocatedReferenceInr: string;
+    allocatedDirectBurnEmber: string;
+    allocatedBuybackEmber: string;
+    burnedEmberByChainState: Record<string, string>;
+  };
+  byStatus: Record<
+    string,
+    { count: number; revenueInr: string; basisInr: string; customerInr: string }
+  >;
+  recent: ExchangeRevenueEventRecord[];
+}
+
+/**
+ * MODULE 08 x MODULE 11 — what settled USDT orders fed the burn engine, and
+ * what the engine made of each one.
+ *
+ * The policy travels with the figures on purpose: "0 EMBER burned" has at
+ * least three causes, and the page cannot tell them apart from the totals.
+ */
+export async function getExchangeRevenue(limit = 20): Promise<ExchangeRevenueSummary> {
+  return request<ExchangeRevenueSummary>(
+    `tokenomics/exchange-revenue?limit=${encodeURIComponent(String(limit))}`,
+  );
+}
+
+/**
+ * MODULE 08 x MODULE 11 — drain the settled-order queue now instead of waiting
+ * for the worker's next tick. PLATFORM_ADMIN only; the backend refuses anyone
+ * else, so the page offers it to admins and nothing else.
+ */
+export async function runExchangeRevenueOnce(): Promise<{ processed: number }> {
+  return request<{ processed: number }>("tokenomics/exchange-revenue/run-once", {
+    method: "POST",
+  });
 }
 
 // ---------------------------------------------------------------------------

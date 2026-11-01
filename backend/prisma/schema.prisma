@@ -170,10 +170,23 @@ enum FillSide {
 
 /// Direction of one expert paper order.
 ///
-/// MODULE 06c. Reuses the same two-direction vocabulary as `FillSide`.
+/// MODULE 06c. LONG and SHORT, not BUY and SELL: an order names the direction
+/// it takes the book, and the book may be flat, long or short. A SELL against a
+/// short position is not "selling" - it is buying the position back - so a
+/// vocabulary of two sides cannot describe what an order did to the book.
 enum PaperOrderSide {
-  BUY
-  SELL
+  LONG
+  SHORT
+}
+
+/// Which way an open position points.
+///
+/// MODULE 06c/07. Stored next to a strictly positive quantity rather than as a
+/// signed number, so a reader of the row cannot mistake a short for a
+/// long-sized position or vice versa.
+enum PositionDirection {
+  LONG
+  SHORT
 }
 
 /// Lifecycle of one expert paper order.
@@ -198,10 +211,12 @@ enum PaperRejectReason {
   STALE_MARKET_DATA
   /// Equities are outside the regular US session.
   MARKET_CLOSED
-  /// A BUY whose gross cost exceeds the strategy's paper cash.
+  /// A LONG whose gross cost exceeds the strategy's paper cash.
   INSUFFICIENT_PAPER_CASH
-  /// A SELL of more paper quantity than the strategy holds.
+  /// A SHORT against a position that does not exist to reduce.
   INSUFFICIENT_POSITION
+  /// The trader's real USDT wallet cannot cover the order's notional.
+  INSUFFICIENT_WALLET_BALANCE
 }
 
 // ---------------------------------------------------------------------------
@@ -293,6 +308,8 @@ model User {
   /// Every deposit this user made (Module 03b). Back-relation only: the
   /// `wallet_deposits` table carries the user column.
   walletDeposits WalletDeposit[]
+  /// Exchange revenue events detected from this user's settled orders.
+  exchangeRevenueEvents ExchangeRevenueEvent[]
 
   /// timestamptz rather than a naive timestamp: the master plan requires UTC
   /// timestamps internally, and a naive column silently reinterprets its value
@@ -950,9 +967,14 @@ model PaperOrder {
   /// Why a REJECTED row was refused; null on FILLED.
   rejectReason PaperRejectReason? @map("reject_reason")
 
-  /// The server-selected fill price (ask for BUY, bid for SELL), never
+  /// The server-selected fill price (ask for LONG, bid for SHORT), never
   /// client-supplied. Null on REJECTED and irrelevant there.
   fillPrice Decimal? @map("fill_price") @db.Decimal(38, 18)
+
+  /// Profit or loss this single fill realised, when it closed part of a
+  /// position against it. Null when the fill opened or added to one - a LONG
+  /// that opens a position moves cash and realises nothing.
+  realizedPnl Decimal? @map("realized_pnl") @db.Decimal(38, 18)
 
   /// When the request was accepted for evaluation.
   placedAt DateTime @default(now()) @map("placed_at") @db.Timestamptz(3)
@@ -975,15 +997,21 @@ model PaperOrder {
 
 /// One expert strategy's current paper holding in one instrument.
 ///
-/// Long-only and one row per instrument: a BUY upserts it, a SELL decrements
-/// it, and a SELL that empties it deletes the row - zero rows are never stored.
-/// `average_entry_price` is maintained exactly (weighted by quantity) so a
-/// partial SELL can compute realized P&L without replaying history.
+/// One row per instrument, and the row may point either way: `direction` says
+/// whether the strategy is long or short the instrument, `quantity` is the
+/// magnitude and is always strictly greater than zero. An order that moves the
+/// book against the position reduces it, and a row that reaches zero is deleted
+/// rather than stored - zero rows are never stored. `average_entry_price` is
+/// maintained exactly (weighted by quantity) so a partial reduction can compute
+/// realized P&L without replaying history.
 model PaperPosition {
   strategyId String @map("strategy_id") @db.Uuid
   symbol     String
 
   strategy Strategy @relation(fields: [strategyId], references: [id], onDelete: Cascade)
+
+  /// Which way this holding points.
+  direction PositionDirection @default(LONG)
 
   /// Base-asset units held. Always strictly greater than zero.
   quantity Decimal @db.Decimal(38, 18)
@@ -1076,12 +1104,14 @@ enum CopyRejectReason {
   STRATEGY_NOT_ELIGIBLE
   /// Expert quantity x allocation rounds down to zero at the 8-place precision.
   ALLOCATION_ROUNDED_TO_ZERO
-  /// The follower's copy cash cannot fund even one unit of the scaled buy.
+  /// The follower's copy cash cannot fund even one unit of the scaled order.
   INSUFFICIENT_COPY_CASH
-  /// The follower holds none of the symbol, so there is nothing to sell.
+  /// The follower holds none of the symbol, so there is nothing to reduce.
   INSUFFICIENT_POSITION
   /// The expert fill carried no usable execution price to mirror.
   PRICE_UNAVAILABLE
+  /// The follower's real USDT wallet cannot cover the mirrored notional.
+  INSUFFICIENT_WALLET_BALANCE
 }
 
 /// One follower's relationship with one expert strategy.
@@ -1193,11 +1223,15 @@ model CopyPosition {
 
   follow StrategyFollow @relation(fields: [followerId, strategyId], references: [followerId, strategyId], onDelete: Cascade)
 
+  /// Which way this holding points. A copy mirrors the expert, so the follower
+  /// is long when the expert is long and short when the expert is short.
+  direction PositionDirection @default(LONG)
+
   /// Base-asset units held. Always strictly greater than zero.
   quantity Decimal @db.Decimal(38, 18)
 
   /// Quantity-weighted average entry price, maintained exactly so a partial
-  /// SELL can compute realized P&L without replaying the event history.
+  /// reduction can compute realized P&L without replaying the event history.
   averageEntryPrice Decimal @map("average_entry_price") @db.Decimal(38, 18)
 
   openedAt DateTime @default(now()) @map("opened_at") @db.Timestamptz(3)
@@ -1248,6 +1282,10 @@ model CopyEvent {
   quantity  Decimal   @default(0) @db.Decimal(38, 18)
   fillPrice Decimal?  @map("fill_price") @db.Decimal(38, 18)
   gross     Decimal?  @db.Decimal(38, 18)
+
+  /// Profit or loss this single copied fill realised, when it closed part of a
+  /// position against it. Null when the fill opened or added to one.
+  realizedPnl Decimal? @map("realized_pnl") @db.Decimal(38, 18)
 
   status       CopyEventStatus
   rejectReason CopyRejectReason? @map("reject_reason")
@@ -1367,6 +1405,8 @@ model UsdtOrder {
   /// Simulated LP allocation slices that funded this order (Module 09).
   /// Back-relation only: the slices live on `liquidity_allocations`.
   allocations LiquidityAllocation[]
+  /// Exchange revenue this order funded (Module 08 x 11 integration).
+  revenueEvent ExchangeRevenueEvent?
 }
 
 // ---------------------------------------------------------------------------
@@ -1717,6 +1757,8 @@ model TokenAllocation {
   /// The simulated buybacks proposed against this allocation. Back-relation:
   /// `token_buybacks.allocation_id` is unique, so an allocation has at most one.
   buybacks TokenBuyback[]
+  /// The exchange revenue event that proposed this allocation, if any.
+  revenueEvent ExchangeRevenueEvent?
 }
 
 /// One simulated EMBER buyback proposed from an allocation's buyback portion
@@ -1768,6 +1810,8 @@ model TokenBuyback {
   /// Back-relation: `token_burns.buyback_id` is unique, so at most one - the
   /// database is what prevents burning one execution twice.
   burn TokenBurn?
+  /// The exchange revenue event that proposed this buyback, if any.
+  revenueEvent ExchangeRevenueEvent?
 }
 
 /// One completed EMBER burn (Module 11): the row that actually destroys
@@ -1827,6 +1871,10 @@ model TokenBurn {
   /// The ingested TokensBurned event for this burn, when the burn was
   /// propagated on-chain.
   onChainEvent BlockchainEvent?
+  /// The exchange revenue event that recorded this burn as its DIRECT portion.
+  revenueEventForDirect ExchangeRevenueEvent? @relation("ExchangeDirectBurn")
+  /// The exchange revenue event that recorded this burn as its BUYBACK portion.
+  revenueEventForBuyback ExchangeRevenueEvent? @relation("ExchangeBuybackBurn")
 }
 
 // ---------------------------------------------------------------------------
@@ -2452,4 +2500,144 @@ model SentinelVoiceCall {
   /// THE IDEMPOTENCY KEY: one call job per alert, ever.
   @@unique([alertId], map: "sentinel_voice_calls_alert_id_key")
   @@map("sentinel_voice_calls")
+}
+
+// ---------------------------------------------------------------------------
+// MODULE 08 x MODULE 11 INTEGRATION — exchange revenue outbox
+// ---------------------------------------------------------------------------
+
+/// Lifecycle of one settled order's journey through the tokenomics pipeline.
+/// The queue discipline is Sentinel's: a guarded status transition is the lock,
+/// `attempts` + `nextAttemptAt` are the retry budget, and nothing is ever
+/// re-derived from configuration after the row is written.
+enum ExchangeRevenueStatus {
+  /// The order settled, but the revenue policy attributes no INR to it, so
+  /// nothing was queued. Terminal, and the reason says why.
+  INELIGIBLE
+  /// Revenue was attributed and the pipeline has not finished with it.
+  PENDING
+  /// Claimed by exactly one pass. A crash here is recovered by the sweep.
+  PROCESSING
+  /// Allocation, buyback, execution and both burns are recorded.
+  COMPLETED
+  /// A treasury guardrail (reserve floor or available balance) refused the
+  /// burn. The pipeline is intact and retryable; the guardrail is not bypassed.
+  BLOCKED
+  /// Attempts exhausted on a non-guardrail failure. Nothing was invented: the
+  /// reason and the detail carry what actually happened.
+  FAILED
+}
+
+/// One row per settled USDT order that the tokenomics pipeline was asked to
+/// consider. `order_id` is unique, so an order can never fund two allocations
+/// however often settlement is replayed, retried, or raced.
+///
+/// THE ROW IS WRITTEN INSIDE THE USDT SETTLEMENT TRANSACTION. A BUY that fails,
+/// is refused, or rolls back therefore has no row at all — eligibility is a
+/// property of committed money, not a later judgement about it.
+model ExchangeRevenueEvent {
+  /// Surrogate key.
+  eventId String @id @default(uuid()) @map("event_id") @db.Uuid
+
+  /// The order this revenue is attributable to. THE IDEMPOTENCY KEY.
+  orderId String @unique @map("order_id") @db.Uuid
+  order   UsdtOrder @relation(fields: [orderId], references: [orderId], onDelete: Restrict)
+
+  /// The customer who placed the order. Traceability only — the tokenomics
+  /// records themselves belong to the engine user, because a customer did not
+  /// propose them.
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  // --- Settlement snapshot -------------------------------------------------
+  // Copied at commit time so a later price, LP or configuration change cannot
+  // rewrite what this order actually did.
+
+  side           UsdtOrderSide @map("order_side")
+  usdtAmount     Decimal       @map("order_usdt_amount") @db.Decimal(38, 18)
+  /// INR the customer paid (BUY).
+  customerInr    Decimal       @map("customer_inr") @db.Decimal(38, 18)
+  /// INR the liquidity providers were credited from this order (Module 09).
+  /// This is the figure that makes revenue structural rather than asserted:
+  /// whatever the policy's rate, revenue can never exceed what the settlement
+  /// left behind after LPs were paid.
+  lpInrSettled   Decimal       @map("lp_inr_settled") @db.Decimal(38, 18)
+  /// customerInr - lpInrSettled, floored at zero. Zero for every order settled
+  /// under the current economics, where LP credits equal the customer debit to
+  /// the paisa.
+  retainedInr    Decimal       @map("retained_inr") @db.Decimal(38, 18)
+
+  // --- Policy snapshot ----------------------------------------------------
+
+  /// The sizing mode in force at settlement (`NONE` | `RETAINED_BPS` |
+  /// `VOLUME_LINKED`). Named for what it decides: how much INR, if any, this
+  /// order contributes to the tokenomics engine.
+  revenueMode String       @map("revenue_mode")
+  /// Basis points of retained INR the policy attributes as revenue.
+  /// Read only under `RETAINED_BPS`; ignored by `VOLUME_LINKED`, which sizes on
+  /// volume rather than on a share of margin.
+  revenueBps  Int          @map("revenue_bps")
+  /// INR this settlement made Prometheus. Zero under `VOLUME_LINKED`: trading
+  /// volume is not income, and this column must never be widened to mean
+  /// "something". It answers "how much did the platform earn?", and in an
+  /// exchange that credits its counterparties to the paisa the answer is zero.
+  revenueInr  Decimal      @map("revenue_inr") @db.Decimal(38, 18)
+  /// INR the tokenomics engine was sized against, and therefore the reference
+  /// amount written to the allocation. Under `RETAINED_BPS` this equals
+  /// `revenue_inr`. Under `VOLUME_LINKED` it is the order's own INR value,
+  /// converted to EMBER at `ember_price` and split by the adaptive policy.
+  ///
+  /// The two columns exist because the two bases are different claims. A
+  /// volume-linked allocation says "this much traded, so this much EMBER leaves
+  /// circulation"; it does not say the platform earned it, and the rupees are
+  /// not moved anywhere by this row. What is destroyed is destroyed from the
+  /// treasury's own inventory, under the same reserve floor as any other burn.
+  basisInr    Decimal      @map("basis_inr") @db.Decimal(38, 18)
+  /// The configured EMBER distribution price the quantities were derived at
+  /// (INR per EMBER). A configured constant, not a market observation.
+  emberPrice  Decimal      @map("ember_price") @db.Decimal(38, 18)
+  /// The direct-burn / buyback split the allocation was recorded under.
+  directBurnPct Int @map("direct_burn_pct")
+  buybackPct    Int @map("buyback_pct")
+
+  // --- Outcome ------------------------------------------------------------
+
+  status     ExchangeRevenueStatus @default(PENDING)
+  /// Machine-readable reason, always set: why an order was skipped, or what a
+  /// guardrail refused. Drawn from the closed set in
+  /// `tokenomics/domain/exchange-revenue.ts`; never a raw stack trace.
+  reasonCode String                @map("reason_code")
+  /// Human-readable detail, bounded. Carries the guardrail's own sentence.
+  detail     String?
+
+  // --- Tokenomics records produced by this event --------------------------
+
+  allocationId   String? @unique @map("allocation_id") @db.Uuid
+  allocation     TokenAllocation? @relation(fields: [allocationId], references: [allocationId], onDelete: Restrict)
+  buybackId      String? @unique @map("buyback_id") @db.Uuid
+  buyback        TokenBuyback?  @relation(fields: [buybackId], references: [buybackId], onDelete: Restrict)
+  /// The burn of the allocation's direct portion (`source: DIRECT`).
+  directBurnId   String? @unique @map("direct_burn_id") @db.Uuid
+  directBurn     TokenBurn?     @relation("ExchangeDirectBurn", fields: [directBurnId], references: [burnId], onDelete: Restrict)
+  /// The burn of the executed buyback quantity (`source: BUYBACK`).
+  buybackBurnId  String? @unique @map("buyback_burn_id") @db.Uuid
+  buybackBurn    TokenBurn?     @relation("ExchangeBuybackBurn", fields: [buybackBurnId], references: [burnId], onDelete: Restrict)
+
+  // --- Queue scheduling ---------------------------------------------------
+
+  attempts      Int       @default(0)
+  /// Retry budget captured at queue time, so a later config change cannot
+  /// silently widen an old job's spend.
+  maxAttempts   Int       @map("max_attempts")
+  nextAttemptAt DateTime? @map("next_attempt_at") @db.Timestamptz(3)
+
+  detectedAt  DateTime  @default(now()) @map("detected_at") @db.Timestamptz(3)
+  processedAt DateTime? @map("processed_at") @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// The worker pass's scan: waiting work, in the order it was detected.
+  @@index([status, nextAttemptAt], map: "exchange_revenue_events_status_next_attempt_idx")
+  /// Dashboard grouping by outcome.
+  @@index([status, detectedAt(sort: Desc)], map: "exchange_revenue_events_status_detected_idx")
+  @@map("exchange_revenue_events")
 }

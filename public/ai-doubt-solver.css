@@ -474,6 +474,15 @@
   transform: rotate(45deg);
 }
 
+/* Top bar holding the echo and expand control */
+.ai-speech-topbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+}
+
 /* What the user last said, so the answer never floats out of context. */
 .ai-speech-echo {
   font-size: 10.5px;
@@ -488,10 +497,45 @@
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+  flex: 1;
 }
 
 .ai-speech-echo::before { content: 'You asked · '; color: var(--ai-text-dim); }
 .ai-speech-echo[hidden] { display: none; }
+
+/* The expand/collapse button for viewing answers clearly */
+.ai-speech-expand-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border-radius: 6px;
+  border: 1px solid var(--ai-border);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--ai-text-dim);
+  cursor: pointer;
+  flex: none;
+  margin-left: auto;
+  transition: all 0.2s ease;
+}
+
+.ai-speech-expand-btn:hover {
+  background: rgba(255, 107, 0, 0.16);
+  border-color: rgba(255, 107, 0, 0.45);
+  color: var(--ai-primary);
+  transform: scale(1.08);
+}
+
+.ai-speech-expand-btn svg {
+  width: 13px;
+  height: 13px;
+}
+
+.ai-speech-expand-btn .ai-icon-collapse {
+  display: none;
+}
 
 .ai-speech-body {
   font-size: 14px;
@@ -499,9 +543,43 @@
   max-height: 116px;
   overflow-y: auto;
   scrollbar-width: thin;
+  transition: max-height 0.3s ease, font-size 0.3s ease;
 }
 
 .ai-speech-text { white-space: pre-wrap; }
+
+/* ── Expanded bubble mode: answers are shown clearly with full breathing room ── */
+.ai-pyrus-speech.is-expanded {
+  width: 480px;
+  max-width: calc(100vw - 36px);
+  max-height: 520px;
+  transform: translateX(-100px);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(255, 107, 0, 0.25);
+  transition: width 0.3s cubic-bezier(0.2, 0.8, 0.2, 1),
+              max-height 0.3s cubic-bezier(0.2, 0.8, 0.2, 1),
+              transform 0.3s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.ai-pyrus-speech.is-expanded .ai-speech-expand-btn .ai-icon-expand {
+  display: none;
+}
+
+.ai-pyrus-speech.is-expanded .ai-speech-expand-btn .ai-icon-collapse {
+  display: block;
+}
+
+.ai-pyrus-speech.is-expanded .ai-speech-body {
+  max-height: 320px;
+  font-size: 14.5px;
+  line-height: 1.68;
+}
+
+@media (max-width: 600px) {
+  .ai-pyrus-speech.is-expanded {
+    width: calc(100vw - 24px);
+    transform: none;
+  }
+}
 
 .ai-speech-dots {
   display: inline-flex;
@@ -707,6 +785,39 @@
   transform: none;
 }
 
+/* --- EMBER balance bar inside the Pyrus scene (above the nameplate) ----- */
+.ai-speech-ember-bar {
+  position: absolute;
+  right: 8px;
+  bottom: 38px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 9.5px;
+  font-weight: 800;
+  font-family: var(--ai-font-mono);
+  letter-spacing: 0.06em;
+  color: #ff9344;
+  background: rgba(255, 106, 26, 0.10);
+  border: 1px solid rgba(255, 106, 26, 0.25);
+  padding: 2px 9px;
+  border-radius: 999px;
+  white-space: nowrap;
+  transition: color 0.3s, background 0.3s;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(4px);
+  transition: opacity 0.4s, transform 0.4s, color 0.3s, background 0.3s;
+}
+
+.ai-pyrus-scene.summoned .ai-speech-ember-bar { opacity: 1; transform: translateY(0); }
+
+.ai-speech-ember-bar.ember-low {
+  color: #ff5252;
+  background: rgba(255, 82, 82, 0.12);
+  border-color: rgba(255, 82, 82, 0.30);
+}
+
 /* --- who he is and whether he can think right now ----------------------- */
 .ai-pyrus-nameplate {
   position: absolute;
@@ -896,6 +1007,52 @@ body.ai-pyrus-card-open .ai-pyrus-scene * { pointer-events: none; }
   height: 12px;
   fill: currentColor;
 }
+
+/* EMBER balance pill — shown in the detail card header */
+.ai-popup-ember-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  font-weight: 800;
+  font-family: var(--ai-font-mono);
+  letter-spacing: 0.06em;
+  color: #ff9344;
+  background: rgba(255, 106, 26, 0.10);
+  border: 1px solid rgba(255, 106, 26, 0.30);
+  padding: 3px 10px;
+  border-radius: 999px;
+  white-space: nowrap;
+  transition: background 0.3s, color 0.3s;
+}
+
+.ai-popup-ember-tag.ember-low {
+  color: #ff5252;
+  background: rgba(255, 82, 82, 0.12);
+  border-color: rgba(255, 82, 82, 0.35);
+}
+
+.ai-popup-ember-tag.ember-spent {
+  animation: aiEmberSpent 0.5s ease;
+}
+
+@keyframes aiEmberSpent {
+  0%   { transform: scale(1.22); opacity: 0.5; }
+  60%  { transform: scale(0.92); }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+.ai-ember-flame {
+  display: inline-block;
+  animation: aiFlameWiggle 2s ease-in-out infinite;
+}
+
+@keyframes aiFlameWiggle {
+  0%, 100% { transform: rotate(-5deg) scale(1); }
+  50%       { transform: rotate(5deg) scale(1.12); }
+}
+
+
 
 .ai-popup-close {
   width: 28px;

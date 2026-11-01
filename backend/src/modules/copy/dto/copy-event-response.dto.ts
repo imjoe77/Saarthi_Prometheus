@@ -31,8 +31,8 @@ export class CopyEventResponseDto {
   @ApiProperty()
   symbol!: string;
 
-  @ApiProperty({ description: 'Direction of the expert order.', enum: ['BUY', 'SELL'] })
-  side!: 'BUY' | 'SELL';
+  @ApiProperty({ description: 'Direction of the expert order.', enum: ['LONG', 'SHORT'] })
+  side!: 'LONG' | 'SHORT';
 
   @ApiProperty({ description: 'Quantity the expert committed.' })
   expertQuantity!: string;
@@ -67,6 +67,14 @@ export class CopyEventResponseDto {
   })
   gross!: string | null;
 
+  @ApiPropertyOptional({
+    description:
+      'Profit or loss this fill realised by closing part of the book. Zero for a fill that only opened or added to a ' +
+      'position, and null when REJECTED.',
+    nullable: true,
+  })
+  realizedPnl!: string | null;
+
   @ApiProperty({ description: 'Outcome.', enum: ['COPIED', 'REJECTED'] })
   status!: 'COPIED' | 'REJECTED';
 
@@ -79,8 +87,8 @@ export class CopyEventResponseDto {
       'STRATEGY_NOT_ELIGIBLE',
       'ALLOCATION_ROUNDED_TO_ZERO',
       'INSUFFICIENT_COPY_CASH',
-      'INSUFFICIENT_POSITION',
       'PRICE_UNAVAILABLE',
+      'INSUFFICIENT_WALLET_BALANCE',
     ],
   })
   rejectReason!: string | null;
@@ -106,6 +114,7 @@ export class CopyEventResponseDto {
       quantity: event.status === 'REJECTED' ? null : decimalString(event.quantity),
       fillPrice: event.fillPrice === null ? null : decimalString(event.fillPrice),
       gross: event.gross === null ? null : decimalString(event.gross),
+      realizedPnl: event.realizedPnl === null ? null : decimalString(event.realizedPnl),
       status: event.status,
       rejectReason: event.rejectReason,
       processedAt: event.processedAt.toISOString(),

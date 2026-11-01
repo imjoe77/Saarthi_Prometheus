@@ -1,6 +1,7 @@
 import { Prisma } from '@prisma/client';
 
 import type { MarketInstrument } from '../../live-data/instruments/instrument-catalogue';
+import type { BookPosition } from '../../trading/domain/position-book';
 import { DEFAULT_PAPER_INITIAL_CASH, evaluatePaperExecution } from './execution';
 
 /**
@@ -11,6 +12,12 @@ import { DEFAULT_PAPER_INITIAL_CASH, evaluatePaperExecution } from './execution'
  * once and asserted on. These are the rules that decide whether real paper
  * money moves, which is why they are tested here in isolation rather than only
  * through the service that surrounds them.
+ *
+ * THE BOOK IS NET. A position is a direction plus a strictly positive
+ * quantity, so an order is not "buy" or "sell" against a holding - it is a
+ * LONG or a SHORT, and what it does to the book depends on what the book
+ * already holds. A SHORT against a flat book opens a short; a LONG against a
+ * short closes it.
  */
 describe('evaluatePaperExecution', () => {
   /** Monday 2026-01-05 15:00 UTC = 10:00 New York, squarely inside the session. */
@@ -40,12 +47,14 @@ describe('evaluatePaperExecution', () => {
 
   const CASH = DEFAULT_PAPER_INITIAL_CASH; // 100000
   const ZERO = new Prisma.Decimal(0);
+  const WALLET = new Prisma.Decimal('1000000');
 
   interface Overrides {
-    side?: 'BUY' | 'SELL';
+    side?: 'LONG' | 'SHORT';
     quantity?: string;
     cash?: Prisma.Decimal;
-    positionQuantity?: string;
+    position?: BookPosition | null;
+    walletUsdt?: Prisma.Decimal;
     instrument?: MarketInstrument;
     bid?: string | undefined;
     ask?: string | undefined;
@@ -68,10 +77,11 @@ describe('evaluatePaperExecution', () => {
     const instrument = overrides.instrument ?? SOL;
 
     return evaluatePaperExecution({
-      side: overrides.side ?? 'BUY',
+      side: overrides.side ?? 'LONG',
       quantity: new Prisma.Decimal(overrides.quantity ?? '1'),
       cash: overrides.cash ?? CASH,
-      positionQuantity: new Prisma.Decimal(overrides.positionQuantity ?? '0'),
+      position: overrides.position ?? null,
+      walletUsdt: overrides.walletUsdt ?? WALLET,
       instrument,
       quote: {
         symbol: instrument.symbol,
@@ -83,35 +93,40 @@ describe('evaluatePaperExecution', () => {
     });
   }
 
-  describe('fills', () => {
-    it('fills a BUY at the ask, never at the bid', () => {
-      const result = evaluate({ side: 'BUY', ask: '100.5', bid: '99.5' });
+  /**
+   * Reads a Decimal as a plain string.
+   *
+   * The plan rounds to the ledger's 18 places, so `100.5` and
+   * `100.500000000000000000` are the same number with different internals -
+   * and Jest's structural equality can tell them apart. The value is what the
+   * test is about, so it is compared as a value.
+   */
+  const asText = (value: Prisma.Decimal | null | undefined): string | null =>
+    value === null || value === undefined ? null : value.toString();
 
-      expect(result).toEqual({
-        filled: true,
-        fillPrice: new Prisma.Decimal('100.5'),
-        gross: new Prisma.Decimal('100.5'),
-      });
+  describe('fills', () => {
+    it('fills a LONG at the ask, never at the bid', () => {
+      const result = evaluate({ side: 'LONG', ask: '100.5', bid: '99.5' });
+
+      expect(result.filled).toBe(true);
+      if (result.filled) {
+        expect(asText(result.fillPrice)).toBe('100.5');
+        expect(asText(result.gross)).toBe('100.5');
+      }
     });
 
-    it('fills a SELL at the bid, never at the ask', () => {
-      const result = evaluate({
-        side: 'SELL',
-        quantity: '2',
-        positionQuantity: '2',
-        bid: '99.5',
-        ask: '100.5',
-      });
+    it('fills a SHORT at the bid, never at the ask', () => {
+      const result = evaluate({ side: 'SHORT', quantity: '2', bid: '99.5', ask: '100.5' });
 
-      expect(result).toEqual({
-        filled: true,
-        fillPrice: new Prisma.Decimal('99.5'),
-        gross: new Prisma.Decimal('199'),
-      });
+      expect(result.filled).toBe(true);
+      if (result.filled) {
+        expect(asText(result.fillPrice)).toBe('99.5');
+        expect(asText(result.gross)).toBe('199');
+      }
     });
 
     it('sizes the gross as quantity times price, at full precision', () => {
-      const result = evaluate({ side: 'BUY', quantity: '0.12345678', ask: '100' });
+      const result = evaluate({ side: 'LONG', quantity: '0.12345678', ask: '100' });
 
       expect(result.filled).toBe(true);
       if (result.filled) {
@@ -119,33 +134,119 @@ describe('evaluatePaperExecution', () => {
       }
     });
 
-    it('fills a BUY that costs exactly the remaining cash, because the check is inclusive', () => {
-      const result = evaluate({ side: 'BUY', quantity: '2', cash: new Prisma.Decimal('201'), ask: '100.5' });
+    it('fills a LONG that costs exactly the remaining cash, because the check is inclusive', () => {
+      const result = evaluate({ side: 'LONG', quantity: '2', cash: new Prisma.Decimal('201'), ask: '100.5' });
 
       expect(result.filled).toBe(true);
     });
 
-    it('fills a SELL of exactly the held position, because the check is inclusive', () => {
-      const result = evaluate({ side: 'SELL', quantity: '2', positionQuantity: '2' });
-
-      expect(result.filled).toBe(true);
-    });
-
-    it('falls back to the bid when an ask is missing on a BUY', () => {
-      const result = evaluate({ side: 'BUY', ask: undefined, bid: '42' });
+    it('falls back to the bid when an ask is missing on a LONG', () => {
+      const result = evaluate({ side: 'LONG', ask: undefined, bid: '42' });
 
       expect(result.filled).toBe(true);
       if (result.filled) {
-        expect(result.fillPrice).toEqual(new Prisma.Decimal('42'));
+        expect(asText(result.fillPrice)).toBe('42');
       }
     });
 
-    it('falls back to the ask when a bid is missing on a SELL', () => {
-      const result = evaluate({ side: 'SELL', quantity: '1', positionQuantity: '1', bid: undefined, ask: '43' });
+    it('falls back to the ask when a bid is missing on a SHORT', () => {
+      const result = evaluate({ side: 'SHORT', quantity: '1', bid: undefined, ask: '43' });
 
       expect(result.filled).toBe(true);
       if (result.filled) {
-        expect(result.fillPrice).toEqual(new Prisma.Decimal('43'));
+        expect(asText(result.fillPrice)).toBe('43');
+      }
+    });
+  });
+
+  describe('the net book', () => {
+    it('opens a long against a flat book, spending the notional', () => {
+      const result = evaluate({ side: 'LONG', quantity: '2', ask: '100.5' });
+
+      expect(result.filled).toBe(true);
+      if (result.filled) {
+        expect(asText(result.plan.cashDelta)).toBe('-201');
+        expect(asText(result.plan.realizedPnl)).toBe('0');
+        expect(result.plan.position?.direction).toBe('LONG');
+        expect(asText(result.plan.position?.quantity)).toBe('2');
+        expect(asText(result.plan.position?.averageEntryPrice)).toBe('100.5');
+      }
+    });
+
+    it('opens a short against a flat book, bringing the notional in', () => {
+      const result = evaluate({ side: 'SHORT', quantity: '2', bid: '99.5' });
+
+      expect(result.filled).toBe(true);
+      if (result.filled) {
+        expect(asText(result.plan.cashDelta)).toBe('199');
+        expect(asText(result.plan.realizedPnl)).toBe('0');
+        expect(result.plan.position?.direction).toBe('SHORT');
+        expect(asText(result.plan.position?.quantity)).toBe('2');
+      }
+    });
+
+    it('averages the entry price when a long is added to a long', () => {
+      const result = evaluate({
+        side: 'LONG',
+        quantity: '1',
+        ask: '100',
+        position: { direction: 'LONG', quantity: new Prisma.Decimal('1'), averageEntryPrice: new Prisma.Decimal('200') },
+      });
+
+      expect(result.filled).toBe(true);
+      if (result.filled) {
+        expect(asText(result.plan.position?.quantity)).toBe('2');
+        expect(asText(result.plan.position?.averageEntryPrice)).toBe('150');
+        expect(asText(result.plan.realizedPnl)).toBe('0');
+      }
+    });
+
+    it('closes a long and realises the loss when a SHORT faces it', () => {
+      const result = evaluate({
+        side: 'SHORT',
+        quantity: '2',
+        bid: '90',
+        position: { direction: 'LONG', quantity: new Prisma.Decimal('2'), averageEntryPrice: new Prisma.Decimal('100') },
+      });
+
+      expect(result.filled).toBe(true);
+      if (result.filled) {
+        expect(asText(result.plan.realizedPnl)).toBe('-20');
+        expect(result.plan.closedPosition).toBe(true);
+        expect(result.plan.position).toBeNull();
+      }
+    });
+
+    it('closes a short and realises the gain when a LONG faces it', () => {
+      const result = evaluate({
+        side: 'LONG',
+        quantity: '2',
+        ask: '90',
+        position: { direction: 'SHORT', quantity: new Prisma.Decimal('2'), averageEntryPrice: new Prisma.Decimal('100') },
+      });
+
+      expect(result.filled).toBe(true);
+      if (result.filled) {
+        expect(asText(result.plan.realizedPnl)).toBe('20');
+        expect(result.plan.closedPosition).toBe(true);
+        expect(result.plan.position).toBeNull();
+      }
+    });
+
+    it('flips the book when the order is larger than the position it faces', () => {
+      const result = evaluate({
+        side: 'SHORT',
+        quantity: '3',
+        bid: '100',
+        position: { direction: 'LONG', quantity: new Prisma.Decimal('1'), averageEntryPrice: new Prisma.Decimal('100') },
+      });
+
+      expect(result.filled).toBe(true);
+      if (result.filled) {
+        expect(asText(result.plan.realizedPnl)).toBe('0');
+        expect(result.plan.closedPosition).toBe(true);
+        expect(result.plan.position?.direction).toBe('SHORT');
+        expect(asText(result.plan.position?.quantity)).toBe('2');
       }
     });
   });
@@ -258,41 +359,67 @@ describe('evaluatePaperExecution', () => {
     });
   });
 
-  describe('INSUFFICIENT_PAPER_CASH', () => {
-    it('rejects a BUY that costs more than the cash on hand', () => {
-      const result = evaluate({ side: 'BUY', quantity: '2', cash: new Prisma.Decimal('200'), ask: '100.5' });
+  describe('INSUFFICIENT_WALLET_BALANCE', () => {
+    it('rejects a LONG whose notional the real wallet cannot cover', () => {
+      const result = evaluate({
+        side: 'LONG',
+        quantity: '2',
+        walletUsdt: new Prisma.Decimal('200'),
+        ask: '100.5',
+      });
 
-      expect(result).toEqual({ filled: false, rejectReason: 'INSUFFICIENT_PAPER_CASH' });
+      expect(result).toEqual({ filled: false, rejectReason: 'INSUFFICIENT_WALLET_BALANCE' });
     });
 
-    it('never applies to a SELL, which only spends a position', () => {
+    it('rejects a SHORT whose notional the real wallet cannot cover', () => {
       const result = evaluate({
-        side: 'SELL',
-        quantity: '1',
-        positionQuantity: '1',
-        cash: ZERO,
+        side: 'SHORT',
+        quantity: '2',
+        walletUsdt: new Prisma.Decimal('100'),
         bid: '99.5',
+      });
+
+      expect(result).toEqual({ filled: false, rejectReason: 'INSUFFICIENT_WALLET_BALANCE' });
+    });
+
+    it('accepts a notional the wallet covers exactly', () => {
+      const result = evaluate({
+        side: 'LONG',
+        quantity: '2',
+        walletUsdt: new Prisma.Decimal('201'),
+        ask: '100.5',
       });
 
       expect(result.filled).toBe(true);
     });
+
+    it('is checked before the paper cash, because it is the stronger statement', () => {
+      const result = evaluate({
+        side: 'LONG',
+        quantity: '2',
+        cash: new Prisma.Decimal('1'),
+        walletUsdt: new Prisma.Decimal('1'),
+        ask: '100.5',
+      });
+
+      expect(result).toEqual({ filled: false, rejectReason: 'INSUFFICIENT_WALLET_BALANCE' });
+    });
   });
 
-  describe('INSUFFICIENT_POSITION', () => {
-    it('rejects a SELL larger than the position', () => {
-      const result = evaluate({ side: 'SELL', quantity: '3', positionQuantity: '2' });
+  describe('INSUFFICIENT_PAPER_CASH', () => {
+    it('rejects a LONG that costs more than the cash on hand', () => {
+      const result = evaluate({ side: 'LONG', quantity: '2', cash: new Prisma.Decimal('200'), ask: '100.5' });
 
-      expect(result).toEqual({ filled: false, rejectReason: 'INSUFFICIENT_POSITION' });
+      expect(result).toEqual({ filled: false, rejectReason: 'INSUFFICIENT_PAPER_CASH' });
     });
 
-    it('rejects a SELL with no position at all', () => {
-      const result = evaluate({ side: 'SELL', quantity: '1', positionQuantity: '0' });
-
-      expect(result).toEqual({ filled: false, rejectReason: 'INSUFFICIENT_POSITION' });
-    });
-
-    it('never applies to a BUY, which only spends cash', () => {
-      const result = evaluate({ side: 'BUY', quantity: '5', positionQuantity: '0' });
+    it('never applies to a SHORT, which brings the notional in rather than spending it', () => {
+      const result = evaluate({
+        side: 'SHORT',
+        quantity: '1',
+        cash: ZERO,
+        bid: '99.5',
+      });
 
       expect(result.filled).toBe(true);
     });
@@ -325,7 +452,7 @@ describe('evaluatePaperExecution', () => {
     });
 
     it('reports insufficient cash over an otherwise valid quote', () => {
-      const result = evaluate({ side: 'BUY', quantity: '1000', cash: new Prisma.Decimal('1'), ask: '100.5' });
+      const result = evaluate({ side: 'LONG', quantity: '1000', cash: new Prisma.Decimal('1'), ask: '100.5' });
 
       expect(result).toEqual({ filled: false, rejectReason: 'INSUFFICIENT_PAPER_CASH' });
     });

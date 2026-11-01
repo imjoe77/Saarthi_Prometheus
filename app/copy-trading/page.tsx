@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useMemo, useState } from "react";
 import dynamic from "next/dynamic";
 import {
   AlertTriangle,
+  Flame,
   Loader2,
   MessageSquare,
   RefreshCw,
@@ -14,6 +15,7 @@ import {
 } from "lucide-react";
 
 import AppShell from "@/components/AppShell";
+import { ExpertChatModal } from "@/components/ExpertChatModal";
 import {
   ApiError,
   discoverStrategies,
@@ -23,7 +25,6 @@ import {
   getCopyFollowAccount,
   getCopyPerformance,
   getInstruments,
-  getQuote,
   listCopyEvents,
   listCopyFollows,
   listCopyOrders,
@@ -39,10 +40,11 @@ import {
   type CopyPerformance,
   type InstrumentDto,
   type PublicStrategySummary,
-  type QuoteDto,
 } from "@/lib/api-client";
 import { copyTradingStyles } from "@/lib/design/copyTrading-styles";
 import { COPY_SYMBOL_COLOURS } from "@/lib/design/copyPalette";
+import type { ChartMarker } from "@/components/StrategyChart";
+import type { UTCTimestamp } from "lightweight-charts";
 
 /**
  * The copy-trading desk, in the reference design's layout.
@@ -71,6 +73,13 @@ type Timeframe = (typeof TIMEFRAMES)[number];
  * denser series would be unreadable rather than more informative.
  */
 const CHART_BARS_LIMIT = 120;
+
+/**
+ * How many candles the Copy-activity chart asks for. Wider than the detail
+ * pane's: the copied fills are markers on this series, so the window has to
+ * be long enough to hold a fill and the move that followed it.
+ */
+const ACTIVITY_BARS_LIMIT = 160;
 
 /**
  * The chart is loaded on the client only. lightweight-charts touches `window`
@@ -133,8 +142,8 @@ const ELIGIBILITY_LABEL: Record<CopyEligibility, string> = {
   STRATEGY_NOT_ELIGIBLE: "The strategy is no longer public and active",
   ALLOCATION_ROUNDED_TO_ZERO: "The allocation rounds to zero at asset precision",
   INSUFFICIENT_COPY_CASH: "The copy pot does not have enough cash",
-  INSUFFICIENT_POSITION: "There is no held position to sell from",
   PRICE_UNAVAILABLE: "The expert fill had no usable price",
+  INSUFFICIENT_WALLET_BALANCE: "Your USDT wallet balance does not cover the copy",
 };
 
 const CHAT_SCRIPT: Array<{ match: RegExp; reply: string }> = [
@@ -151,7 +160,7 @@ const CHAT_SCRIPT: Array<{ match: RegExp; reply: string }> = [
   {
     match: /skip|refus|reject|why|failed/i,
     reply:
-      "Open the History tab. Every refusal is a row with its reason — insufficient copy cash, allocation rounded to zero, price unavailable, strategy ineligible, or nothing held to sell. Nothing is silently dropped.",
+      "Open the History tab. Every refusal is a row with its reason — the copy pot had no cash, your USDT balance did not cover it, the allocation rounded to zero, the expert fill had no usable price, or the strategy was not eligible. Nothing is silently dropped.",
   },
   {
     match: /roi|profit|return|sharpe|drawdown/i,
@@ -159,9 +168,9 @@ const CHAT_SCRIPT: Array<{ match: RegExp; reply: string }> = [
       "I cannot show ROI, Sharpe or drawdown, because the platform does not measure them. The copy pot exposes cash, realized P&L and positions; inventing the rest would be worse than leaving it out.",
   },
   {
-    match: /risk|safe|stop|unfollow/i,
+    match: /risk|safe|stop|unfollow|long|short/i,
     reply:
-      "Risk controls are structural: each follow has its own cash pot, allocation bounds the mirrored size, a sell is capped by what you actually hold, and Stop following stops new copies without liquidating anything.",
+      "Risk controls are structural: each follow has its own cash pot, allocation bounds the mirrored size, a LONG spends cash and a SHORT brings the notional in, and Stop following stops new copies without liquidating anything.",
   },
 ];
 
@@ -184,6 +193,14 @@ function pctFromFraction(fraction: string): number {
   const parsed = Number(fraction) * 100;
   if (!Number.isFinite(parsed)) return 1;
   return Math.max(1, Math.min(100, Math.round(parsed)));
+}
+
+/** The colour of a signed figure: green for a gain, red for a loss. */
+function pnlTone(value: string | null): string | undefined {
+  if (value === null) return undefined;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return undefined;
+  return parsed >= 0 ? "var(--gain)" : "var(--loss)";
 }
 
 function shortDate(value: string | null): string {
@@ -235,6 +252,15 @@ export default function CopyTradingPage() {
   const [barsError, setBarsError] = useState<string | null>(null);
   const [barsNonce, setBarsNonce] = useState(0);
 
+  // The Copy-activity candle series. It reads the market the engine actually
+  // traded, so the fills sit on the candles they were filled against.
+  const [activityPick, setActivityPick] = useState("");
+  const [activityTimeframe, setActivityTimeframe] = useState<Timeframe>("5m");
+  const [activityBars, setActivityBars] = useState<BarDto[]>([]);
+  const [activityBarsStatus, setActivityBarsStatus] = useState<LoadStatus>("loading");
+  const [activityBarsError, setActivityBarsError] = useState<string | null>(null);
+  const [activityBarsNonce, setActivityBarsNonce] = useState(0);
+
   const [allocationPct, setAllocationPct] = useState(50);
   const [busy, setBusy] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -249,13 +275,12 @@ export default function CopyTradingPage() {
     orders: CopyEvent[];
   } | null>(null);
 
-  // The copy book across every follow: the tape, the profit-and-loss path and
-  // the live quotes the open positions are marked against.
+  // The copy book across every follow: the tape and the profit-and-loss path.
   const [events, setEvents] = useState<CopyEvent[]>([]);
   const [performance, setPerformance] = useState<CopyPerformance | null>(null);
-  const [quotes, setQuotes] = useState<Record<string, QuoteDto>>({});
   const [activityError, setActivityError] = useState<string | null>(null);
 
+  const [expertChatOpen, setExpertChatOpen] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
   const [chatInput, setChatInput] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([
@@ -355,6 +380,11 @@ export default function CopyTradingPage() {
     setBarsNonce((value) => value + 1);
   };
 
+  const retryActivityBars = () => {
+    setActivityBarsStatus("loading");
+    setActivityBarsNonce((value) => value + 1);
+  };
+
   const retryInstruments = () => {
     setInstrumentsLoading(true);
     setInstrumentsNonce((value) => value + 1);
@@ -388,38 +418,23 @@ export default function CopyTradingPage() {
   }, [loadActivity]);
 
   /**
-   * The live quote for every instrument the book is holding, so the open
-   * positions can be marked.
+   * The copy book, re-read on a timer so the marks stay live.
    *
-   * A quote that is unavailable is kept as an unavailable quote rather than
-   * dropped: the section says which positions have no mark, and a position
-   * silently missing from the count would read as "nothing held".
+   * The engine prices every open position and returns the mark, the signed
+   * market value and the unrealised P&L with it. The screen does not price
+   * anything itself: a second quote read here could disagree with the engine
+   * between the two, and a follower would have no way to tell which one was
+   * right. A failed poll is left alone - the last good book stays on screen
+   * and the next tick tries again.
    */
   useEffect(() => {
-    const symbols = aggregate?.positions.map((position) => position.symbol) ?? [];
-    if (symbols.length === 0) {
-      setQuotes({});
-      return;
-    }
-
-    let active = true;
-    Promise.all(
-      symbols.map((symbol) =>
-        getQuote(symbol).catch(() => null),
-      ),
-    ).then((list) => {
-      if (!active) return;
-      const next: Record<string, QuoteDto> = {};
-      for (const quote of list) {
-        if (quote) next[quote.symbol] = quote;
-      }
-      setQuotes(next);
-    });
-
-    return () => {
-      active = false;
-    };
-  }, [aggregate]);
+    const timer = window.setInterval(() => {
+      getCopyAggregateAccount()
+        .then((account) => setAggregate(account))
+        .catch(() => undefined);
+    }, 15000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   /**
    * The expert's trades, as the charts need them.
@@ -470,41 +485,123 @@ export default function CopyTradingPage() {
   );
 
   /**
-   * The open positions, marked.
+   * The open positions, as the engine marked them.
    *
-   * `unrealized` is null whenever any held position has no quote, because a
-   * total that silently omits an unmarkable position is not a total - it is a
-   * smaller number wearing a total's label. The cost basis is always exact,
-   * since it comes from the average entry the ledger holds.
+   * `total` is null whenever any held position has no price, because a total
+   * that silently omits an unmarkable position is not a total - it is a
+   * smaller number wearing a total's label.
    */
   const mark = useMemo(() => {
     const positions = aggregate?.positions ?? [];
-    let cost = 0;
-    let value = 0;
+    let total = 0;
     let unmarked = 0;
 
     for (const position of positions) {
-      const quantity = Number(position.quantity);
-      const entry = Number(position.averageEntryPrice);
-      if (!Number.isFinite(quantity) || !Number.isFinite(entry)) continue;
-      cost += quantity * entry;
-
-      const quote = quotes[position.symbol];
-      const price = quote?.available ? Number(quote.price) : null;
-      if (price === null || !Number.isFinite(price)) {
+      if (position.unrealizedPnl === null) {
         unmarked += 1;
         continue;
       }
-      value += quantity * price;
+      const value = Number(position.unrealizedPnl);
+      if (!Number.isFinite(value)) {
+        unmarked += 1;
+        continue;
+      }
+      total += value;
     }
 
     return {
-      cost,
-      value,
-      unmarked,
-      unrealized: positions.length === 0 ? 0 : unmarked === 0 ? value - cost : null,
+      total: positions.length === 0 || unmarked > 0 ? null : total,
     };
-  }, [aggregate, quotes]);
+  }, [aggregate]);
+
+  /**
+   * The markets this book has actually traded.
+   *
+   * Both lists come from the ledger, so the candle chart cannot offer a
+   * symbol the follower has never filled and never held.
+   */
+  const tradedSymbols = useMemo(() => {
+    const symbols = new Set<string>();
+    for (const event of events) symbols.add(event.symbol);
+    for (const position of aggregate?.positions ?? []) symbols.add(position.symbol);
+    return [...symbols].sort((left, right) => left.localeCompare(right));
+  }, [aggregate, events]);
+
+  /**
+   * The market the candle chart shows.
+   *
+   * It defaults to the first market the book traded, and the reader can pick
+   * another one after that. The default is derived rather than stored, so the
+   * chart never has to be told what to show after a late-arriving event.
+   */
+  const activitySymbol = activityPick || events[0]?.symbol || aggregate?.positions[0]?.symbol || "";
+
+  /**
+   * The copied fills drawn on the candle series, so a fill can be read
+   * against the candles it happened in.
+   *
+   * The marker's time is the expert's own fill time - the market moment the
+   * price was struck - and not the moment the copy engine consumed it.
+   */
+  const activityMarkers = useMemo<ChartMarker[]>(() => {
+    if (!activitySymbol) return [];
+    const list: ChartMarker[] = [];
+
+    for (const event of events) {
+      if (event.symbol !== activitySymbol) continue;
+      if (event.status !== "COPIED" || event.fillPrice === null) continue;
+      const timeMs = Date.parse(event.expertFilledAt);
+      if (Number.isNaN(timeMs)) continue;
+      list.push({
+        time: Math.floor(timeMs / 1000) as UTCTimestamp,
+        side: event.side,
+        text: `${event.side} ${num(event.quantity, 6)}`,
+      });
+    }
+
+    return list;
+  }, [activitySymbol, events]);
+
+  /**
+   * The symbol picker for the candle chart. The current pick stays in the
+   * list even if the book has moved on, so the chart never blanks itself
+   * under the reader.
+   */
+  const activitySymbols = useMemo(() => {
+    const symbols = new Set(tradedSymbols);
+    if (activitySymbol) symbols.add(activitySymbol);
+    return [...symbols].sort((left, right) => left.localeCompare(right));
+  }, [activitySymbol, tradedSymbols]);
+
+  /**
+   * The candle series behind the Copy-activity chart.
+   *
+   * It is read for the market the engine traded, at the timeframe the reader
+   * picked. A market the feed cannot price is reported as such - an empty
+   * chart is honest, a drawn one would not be. The loading flag is raised by
+   * the handler that asked for the series, never here, because the handler is
+   * the honest place to say the user just asked for something else.
+   */
+  useEffect(() => {
+    if (!activitySymbol) return;
+    let active = true;
+    getBars(activitySymbol, activityTimeframe, ACTIVITY_BARS_LIMIT)
+      .then((result) => {
+        if (!active) return;
+        setActivityBars(result.items);
+        setActivityBarsError(null);
+        setActivityBarsStatus("ready");
+      })
+      .catch((cause: unknown) => {
+        if (!active) return;
+        setActivityBars([]);
+        setActivityBarsError(messageFor(cause));
+        setActivityBarsStatus("error");
+      });
+    return () => {
+      active = false;
+    };
+  }, [activitySymbol, activityTimeframe, activityBarsNonce]);
 
   /**
    * Re-reads the catalogue, the follows and the aggregate without touching the
@@ -556,7 +653,7 @@ export default function CopyTradingPage() {
         if (!active) return;
         setAccountData({
           strategyId: selectedId,
-          account: { account: null, positions: [] },
+          account: { account: null, positions: [], walletUsdt: "0" },
           orders: [],
         });
         setActionError(messageFor(cause));
@@ -571,6 +668,27 @@ export default function CopyTradingPage() {
     const timer = window.setTimeout(() => setToast(null), 2600);
     return () => window.clearTimeout(timer);
   }, [toast]);
+
+  const [focusedEventId, setFocusedEventId] = useState<string | null>(null);
+
+  /**
+   * Tells the trade-buddy which market this page is looking at.
+   *
+   * The widget reads the pointer and asks the ledger about it, so the answer
+   * comes from the server's own records. The page sends no price and no
+   * quantity - a pointer is all a page is allowed to say.
+   */
+  useEffect(() => {
+    const detailSymbol = detailForSelected?.account?.positions[0]?.symbol ?? detailForSelected?.orders[0]?.symbol ?? null;
+    const potSymbol = accountData?.account.positions[0]?.symbol ?? null;
+    const symbol = detailSymbol ?? potSymbol ?? events[0]?.symbol ?? aggregate?.positions[0]?.symbol ?? null;
+    const defaultEventId = detailForSelected?.orders[0]?.expertOrderId ?? events[0]?.expertOrderId ?? null;
+    const activeFocusId = focusedEventId ? `copy-event:${focusedEventId}` : (defaultEventId ? `copy-event:${defaultEventId}` : null);
+    window.PROMETHEUS_PAGE_CONTEXT = { page: "copy-trading", symbol, focusId: activeFocusId };
+    return () => {
+      delete window.PROMETHEUS_PAGE_CONTEXT;
+    };
+  }, [accountData, events, aggregate, detailForSelected, focusedEventId]);
 
   const selectStrategy = (id: string) => {
     setSelectedId(id);
@@ -761,10 +879,30 @@ export default function CopyTradingPage() {
               <b className="mono">{aggregate ? aggregate.positions.length : "—"}</b>
               <span className="kpi-sub">
                 {aggregate && aggregate.positions.length > 0
-                  ? aggregate.positions.map((position) => position.symbol).join(" · ")
+                  ? aggregate.positions
+                      .map((position) => `${position.symbol} ${position.direction}`)
+                      .join(" · ")
                   : "No open copy positions"}
               </span>
             </div>
+          </div>
+
+          {/*
+            THE WALLET IS A GATE, NOT A DEBIT. The balance shown here is the
+            follower's real USDT, and the server refuses a copy whose notional
+            it does not cover. The copy pots are simulated, so they never spend
+            this money - it only has to be there.
+          */}
+          <div className="cp-wallet-strip">
+            <ShieldCheck size={15} aria-hidden="true" />
+            <span className="cp-wallet-amount">
+              <small>Wallet USDT (real)</small>
+              <b className="mono">{aggregate ? num(aggregate.walletUsdt) : "—"}</b>
+            </span>
+            <span className="cp-wallet-note">
+              A gate, not a debit. The copy pots are simulated and never spend this balance — a copy whose
+              notional it cannot cover is refused, and the refusal is recorded with its reason.
+            </span>
           </div>
         </section>
 
@@ -805,7 +943,7 @@ export default function CopyTradingPage() {
                 <ExpertTradesChart trades={trades} height={280} />
               )}
               <div className="activity-marks">
-                <b>▲ buy</b> · <b className="sell">▼ sell</b> — one marker per copied fill, at the price it
+                <b>▲ LONG</b> · <b className="sell">▼ SHORT</b> — one marker per copied fill, at the price it
                 executed at.
               </div>
               <div className="activity-legend">
@@ -827,7 +965,8 @@ export default function CopyTradingPage() {
                 <div className="activity-empty">
                   No realized profit or loss yet.
                   <br />
-                  A buy moves cash into a position and realises nothing; the line moves on a sell.
+                  A LONG moves cash into a position and realises nothing; the line moves when a fill reduces a
+                  position.
                 </div>
               ) : (
                 <CopyPnlChart points={pnlPoints} height={220} />
@@ -838,12 +977,183 @@ export default function CopyTradingPage() {
                     Realized {num(performance.realizedPnl)} · {performance.copiedCount} copied ·{" "}
                     {performance.rejectedCount} refused
                     {" · "}
-                    {mark.unrealized === null
-                      ? "open positions have no live quote, so they are not marked"
-                      : `open positions marked at the latest quote: ${mark.unrealized.toLocaleString("en-US", { maximumFractionDigits: 2 })}`}
+                    {mark.total === null
+                      ? "the positions the feed cannot price are not marked"
+                      : `open positions marked by the engine: ${mark.total.toLocaleString("en-US", { maximumFractionDigits: 2 })}`}
                   </>
                 ) : null}
               </div>
+            </div>
+          </div>
+
+          {/*
+            THE CANDLES AND THE BOOK, SIDE BY SIDE. The tape above is a list
+            of prices; the chart is the market those prices were struck in,
+            and the table is what the fills did to the positions they opened.
+          */}
+          <div className="cp-book-grid">
+            <div className="activity-panel">
+              <div className="activity-panel-head">
+                <b>Price action</b>
+                <span>Candles for the market your fills executed in</span>
+              </div>
+
+              <div className="cp-chart-head">
+                <label className="cp-chart-pick">
+                  <small>Market</small>
+                  <select
+                    aria-label="Market to chart"
+                    value={activitySymbol}
+                    disabled={activitySymbols.length === 0}
+                    onChange={(event) => {
+                      setActivityBarsStatus("loading");
+                      setActivityPick(event.target.value);
+                    }}
+                  >
+                    {activitySymbols.map((symbol) => (
+                      <option key={symbol} value={symbol}>
+                        {symbol}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <div className="cp-chart-tf" role="group" aria-label="Timeframe">
+                  {TIMEFRAMES.map((frame) => (
+                    <button
+                      key={frame}
+                      type="button"
+                      aria-pressed={activityTimeframe === frame}
+                      className={activityTimeframe === frame ? "on" : ""}
+                      onClick={() => {
+                        setActivityBarsStatus("loading");
+                        setActivityTimeframe(frame);
+                      }}
+                    >
+                      {frame}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {activitySymbols.length === 0 ? (
+                <div className="activity-empty">
+                  No market has been traded yet.
+                  <br />
+                  The candles appear once the engine consumes its first expert fill.
+                </div>
+              ) : activityBarsStatus === "error" ? (
+                <div className="cp-chart-msg">
+                  <AlertTriangle size={16} />
+                  <b>The candle series could not be loaded</b>
+                  <span>{activityBarsError}</span>
+                  <button type="button" className="cp-chart-retry" onClick={retryActivityBars}>
+                    <RefreshCw size={12} /> Retry
+                  </button>
+                </div>
+              ) : activityBarsStatus === "loading" ? (
+                <div className="cp-chart-msg">
+                  <Loader2 size={16} className="cp-spin" />
+                  <span>
+                    Loading {activitySymbol} · {activityTimeframe}…
+                  </span>
+                </div>
+              ) : activityBars.length === 0 ? (
+                <div className="cp-chart-msg">
+                  <b>No candles for this window</b>
+                  <span>
+                    The provider returned no {activityTimeframe} bars for {activitySymbol}. Nothing is drawn
+                    rather than inventing a series.
+                  </span>
+                </div>
+              ) : (
+                <div className="cp-chart-frame">
+                  <Chart bars={activityBars} markers={activityMarkers} height={300} />
+                </div>
+              )}
+
+              <div className="cp-chart-meta">
+                <span>
+                  {activityBars.length} bars · {activityTimeframe} · {activitySymbol} ·{" "}
+                  {activityMarkers.length} filled marker{activityMarkers.length === 1 ? "" : "s"}
+                </span>
+                <button
+                  type="button"
+                  className="cp-chart-reload"
+                  disabled={activityBarsStatus === "loading"}
+                  onClick={retryActivityBars}
+                >
+                  <RefreshCw size={11} className={activityBarsStatus === "loading" ? "cp-spin" : ""} />
+                  Refresh
+                </button>
+              </div>
+            </div>
+
+            <div className="activity-panel">
+              <div className="activity-panel-head">
+                <b>Open copy positions</b>
+                <span>Marked by the engine at the latest price</span>
+              </div>
+              {(aggregate?.positions.length ?? 0) === 0 ? (
+                <div className="activity-empty">
+                  No open positions.
+                  <br />
+                  Every copied fill so far has been closed by a later one.
+                </div>
+              ) : (
+                <>
+                  <div className="tw">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Market</th>
+                          <th>Side</th>
+                          <th className="r">Quantity</th>
+                          <th className="r">Avg entry</th>
+                          <th className="r">Mark</th>
+                          <th className="r">Value</th>
+                          <th className="r">Unrealised</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {aggregate?.positions.map((position) => (
+                          <tr
+                            key={`${position.symbol}-${position.direction}`}
+                            data-ai-id={`copy-position:${position.symbol}:${position.direction}`}
+                          >
+                            <td style={{ fontWeight: 700 }}>{position.symbol}</td>
+                            <td style={{ color: position.direction === "LONG" ? "var(--gain)" : "var(--loss)" }}>
+                              {position.direction}
+                            </td>
+                            <td className="r mono">{num(position.quantity, 8)}</td>
+                            <td className="r mono">{num(position.averageEntryPrice, 8)}</td>
+                            <td className="r mono">
+                              {position.markPrice === null ? "—" : num(position.markPrice, 4)}
+                            </td>
+                            <td className="r mono">
+                              {position.marketValue === null ? "—" : num(position.marketValue, 2)}
+                            </td>
+                            <td className="r mono" style={{ color: pnlTone(position.unrealizedPnl) }}>
+                              {position.unrealizedPnl === null ? "—" : num(position.unrealizedPnl, 2)}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  {aggregate?.positions.some((position) => position.stale) && (
+                    <p className="cp-fine">
+                      A row marked with a stale price was valued with the last price the feed produced - the
+                      engine could not get a fresh one.
+                    </p>
+                  )}
+                  <div className="activity-marks">
+                    {mark.total === null
+                      ? "the positions the feed cannot price are not marked"
+                      : `Open positions marked by the engine: ${mark.total.toLocaleString("en-US", { maximumFractionDigits: 2 })}`}
+                  </div>
+                </>
+              )}
             </div>
           </div>
 
@@ -870,31 +1180,41 @@ export default function CopyTradingPage() {
                     </td>
                   </tr>
                 ) : (
-                  events.map((event) => (
-                    <tr key={`${event.strategyId}-${event.expertOrderId}`}>
-                      <td>{shortDate(event.processedAt)}</td>
-                      <td className="activity-strategy">{event.strategyName}</td>
-                      <td style={{ fontWeight: 700 }}>{event.symbol}</td>
-                      <td style={{ color: event.side === "BUY" ? "var(--gain)" : "var(--loss)" }}>
-                        {event.side}
-                      </td>
-                      <td className="r mono">{num(event.expertQuantity, 8)}</td>
-                      <td className="r mono">
-                        {event.status === "COPIED" ? num(event.quantity, 8) : "—"}
-                      </td>
-                      <td className="r mono">
-                        {event.status === "COPIED" ? num(event.fillPrice, 4) : "—"}
-                      </td>
-                      <td className="r mono">
-                        {event.status === "COPIED" ? num(event.gross, 2) : "—"}
-                      </td>
-                      <td style={{ color: event.status === "COPIED" ? "var(--gain)" : "var(--amber)" }}>
-                        {event.status === "COPIED"
-                          ? "Copied"
-                          : ELIGIBILITY_LABEL[event.rejectReason ?? "STRATEGY_NOT_ELIGIBLE"]}
-                      </td>
-                    </tr>
-                  ))
+                  events.map((event) => {
+                    const isFocused = focusedEventId === event.expertOrderId;
+                    return (
+                      <tr
+                        key={`${event.strategyId}-${event.expertOrderId}`}
+                        data-ai-id={`copy-event:${event.expertOrderId}`}
+                        onClick={() => setFocusedEventId(event.expertOrderId)}
+                        className={isFocused ? "cp-row-focused" : undefined}
+                        style={{ cursor: "pointer" }}
+                        title="Click to focus Pyrus on this trade"
+                      >
+                        <td>{shortDate(event.processedAt)}</td>
+                        <td className="activity-strategy">{event.strategyName}</td>
+                        <td style={{ fontWeight: 700 }}>{event.symbol}</td>
+                        <td style={{ color: event.side === "LONG" ? "var(--gain)" : "var(--loss)" }}>
+                          {event.side}
+                        </td>
+                        <td className="r mono">{num(event.expertQuantity, 8)}</td>
+                        <td className="r mono">
+                          {event.status === "COPIED" ? num(event.quantity, 8) : "—"}
+                        </td>
+                        <td className="r mono">
+                          {event.status === "COPIED" ? num(event.fillPrice, 4) : "—"}
+                        </td>
+                        <td className="r mono">
+                          {event.status === "COPIED" ? num(event.gross, 2) : "—"}
+                        </td>
+                        <td style={{ color: event.status === "COPIED" ? "var(--gain)" : "var(--amber)" }}>
+                          {event.status === "COPIED"
+                            ? "Copied"
+                            : ELIGIBILITY_LABEL[event.rejectReason ?? "STRATEGY_NOT_ELIGIBLE"]}
+                        </td>
+                      </tr>
+                    );
+                  })
                 )}
               </tbody>
             </table>
@@ -1051,6 +1371,16 @@ export default function CopyTradingPage() {
                       {selected.description ?? "Public strategy"}
                     </span>
                   </div>
+                  <button
+                    type="button"
+                    className="cp-connect-expert-btn"
+                    onClick={() => setExpertChatOpen(true)}
+                    title="Connect and chat directly with this expert trader (10 EMBER)"
+                  >
+                    <Flame size={14} className="cp-flame-icon" />
+                    <span>Chat with Expert</span>
+                    <span className="cp-ember-chip">10 EMBER</span>
+                  </button>
                 </div>
 
                 <div className="dtabs" role="tablist">
@@ -1132,7 +1462,8 @@ export default function CopyTradingPage() {
                       <p className="cp-copy">
                         A follow copies the expert&apos;s committed paper fills at your allocation. Your pot starts
                         empty and is provisioned on the first eligible fill, so &quot;no pot yet&quot; never looks
-                        like a spent balance. Sells are capped by the quantity you actually hold.
+                        like a spent balance. A LONG spends cash to open or add to a long position; a SHORT
+                        brings the notional in and opens or adds to a short.
                       </p>
                     </>
                   )}
@@ -1186,18 +1517,37 @@ export default function CopyTradingPage() {
                               <table>
                                 <thead>
                                   <tr>
-                                    <th>Symbol</th>
+                                    <th>Market</th>
+                                    <th>Side</th>
                                     <th className="r">Quantity</th>
                                     <th className="r">Avg entry</th>
+                                    <th className="r">Mark</th>
+                                    <th className="r">Value</th>
+                                    <th className="r">Unrealised</th>
                                     <th>Last activity</th>
                                   </tr>
                                 </thead>
                                 <tbody>
                                   {detailForSelected.account.positions.map((position) => (
-                                    <tr key={position.symbol}>
+                                    <tr
+                                      key={position.symbol}
+                                      data-ai-id={`copy-position:${position.symbol}:${position.direction}`}
+                                    >
                                       <td style={{ fontWeight: 700 }}>{position.symbol}</td>
+                                      <td style={{ color: position.direction === "LONG" ? "var(--gain)" : "var(--loss)" }}>
+                                        {position.direction}
+                                      </td>
                                       <td className="r mono">{num(position.quantity, 8)}</td>
                                       <td className="r mono">{num(position.averageEntryPrice, 8)}</td>
+                                      <td className="r mono">
+                                        {position.markPrice === null ? "—" : num(position.markPrice, 4)}
+                                      </td>
+                                      <td className="r mono">
+                                        {position.marketValue === null ? "—" : num(position.marketValue, 2)}
+                                      </td>
+                                      <td className="r mono" style={{ color: pnlTone(position.unrealizedPnl) }}>
+                                        {position.unrealizedPnl === null ? "—" : num(position.unrealizedPnl, 2)}
+                                      </td>
                                       <td>{shortDate(position.lastActivityAt)}</td>
                                     </tr>
                                   ))}
@@ -1205,6 +1555,11 @@ export default function CopyTradingPage() {
                               </table>
                             </div>
                           )}
+                          <p className="cp-fine" style={{ marginTop: 12 }}>
+                            Wallet USDT (real): {num(detailForSelected.account.walletUsdt)} — a gate, not a debit.
+                            The pot is simulated and never spends it; a copy this balance cannot cover is
+                            refused.
+                          </p>
                         </>
                       )}
                     </>
@@ -1239,22 +1594,32 @@ export default function CopyTradingPage() {
                               </tr>
                             </thead>
                             <tbody>
-                              {detailForSelected?.orders.map((order) => (
-                                <tr key={`${order.expertOrderId}-${order.processedAt}`}>
-                                  <td>{shortDate(order.processedAt)}</td>
-                                  <td style={{ fontWeight: 700 }}>{order.symbol}</td>
-                                  <td style={{ color: order.side === "BUY" ? "var(--gain)" : "var(--loss)" }}>
-                                    {order.side}
-                                  </td>
-                                  <td className="r mono">{num(order.expertQuantity, 8)}</td>
-                                  <td className="r mono">{order.status === "COPIED" ? num(order.quantity, 8) : "—"}</td>
-                                  <td style={{ color: order.status === "COPIED" ? "var(--gain)" : "var(--amber)" }}>
-                                    {order.status === "COPIED"
-                                      ? "Copied"
-                                      : ELIGIBILITY_LABEL[order.rejectReason ?? "STRATEGY_NOT_ELIGIBLE"]}
-                                  </td>
-                                </tr>
-                              ))}
+                              {detailForSelected?.orders.map((order) => {
+                                const isFocused = focusedEventId === order.expertOrderId;
+                                return (
+                                  <tr
+                                    key={`${order.expertOrderId}-${order.processedAt}`}
+                                    data-ai-id={`copy-event:${order.expertOrderId}`}
+                                    onClick={() => setFocusedEventId(order.expertOrderId)}
+                                    className={isFocused ? "cp-row-focused" : undefined}
+                                    style={{ cursor: "pointer" }}
+                                    title="Click to focus Pyrus on this trade"
+                                  >
+                                    <td>{shortDate(order.processedAt)}</td>
+                                    <td style={{ fontWeight: 700 }}>{order.symbol}</td>
+                                    <td style={{ color: order.side === "LONG" ? "var(--gain)" : "var(--loss)" }}>
+                                      {order.side}
+                                    </td>
+                                    <td className="r mono">{num(order.expertQuantity, 8)}</td>
+                                    <td className="r mono">{order.status === "COPIED" ? num(order.quantity, 8) : "—"}</td>
+                                    <td style={{ color: order.status === "COPIED" ? "var(--gain)" : "var(--amber)" }}>
+                                      {order.status === "COPIED"
+                                        ? "Copied"
+                                        : ELIGIBILITY_LABEL[order.rejectReason ?? "STRATEGY_NOT_ELIGIBLE"]}
+                                    </td>
+                                  </tr>
+                                );
+                              })}
                             </tbody>
                           </table>
                         </div>
@@ -1540,6 +1905,15 @@ export default function CopyTradingPage() {
         </div>
       )}
 
+      {selected && (
+        <ExpertChatModal
+          strategyId={selected.id}
+          strategyName={selected.name}
+          isOpen={expertChatOpen}
+          onClose={() => setExpertChatOpen(false)}
+        />
+      )}
+
       <button
         type="button"
         className="cfab"
@@ -1663,20 +2037,65 @@ const COPY_OVERRIDES = `
 .cp-foot-row .go.stop { margin: 0; }
 .cp-page .history { margin-top: 34px; }
 .cp-page .history button.go { display: inline-flex; align-items: center; gap: 7px; padding: 8px 14px; font-size: 12px; }
-.cp-page .hs { grid-template-columns: repeat(3, minmax(110px, 1fr)); }
-.cp-page .cfab { color: #140800; }
-.cp-page .cchat.on { transform: none; opacity: 1; visibility: visible; }
-.cp-page .cchat { transform: translateY(8px); opacity: 0; visibility: hidden; transition: transform .2s ease, opacity .2s ease, visibility .2s; }
-.cp-page .cchat .msg { max-width: 85%; padding: 9px 12px; border-radius: 12px; font-size: 12.5px; line-height: 1.5; margin: 7px 0; }
-.cp-page .cchat .msg.bot { background: var(--p2); border: 1px solid var(--line); }
-.cp-page .cchat .msg.me { background: var(--soft); border: 1px solid rgba(255,90,31,.25); margin-left: auto; }
-.cp-page .cchips button { background: transparent; border: 1px solid var(--line); color: var(--mute); border-radius: 999px; padding: 5px 10px; font: inherit; font-size: 11px; cursor: pointer; }
-.cp-page .cchips button:hover { color: var(--ember); border-color: var(--ember); }
-.cp-page .cin button { color: var(--ember); }
+.cp-page .cfab, .cp-page .cchat { display: none !important; }
+.cp-connect-expert-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  background: rgba(255, 90, 31, 0.12);
+  border: 1px solid rgba(255, 90, 31, 0.35);
+  border-radius: 10px;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  white-space: nowrap;
+}
+.cp-connect-expert-btn:hover {
+  background: rgba(255, 90, 31, 0.22);
+  border-color: rgba(255, 90, 31, 0.6);
+  transform: translateY(-1px);
+}
+.cp-connect-expert-btn .cp-flame-icon {
+  color: #ff5a1f;
+}
+.cp-ember-chip {
+  display: inline-block;
+  padding: 2px 6px;
+  background: rgba(255, 90, 31, 0.25);
+  border-radius: 6px;
+  font-size: 10px;
+  font-family: monospace;
+  font-weight: 700;
+  color: #ff9166;
+}
+.cp-row-focused {
+  background: rgba(255, 107, 0, 0.12) !important;
+  box-shadow: inset 3px 0 0 var(--ember);
+}
 .cp-page .toast.on { opacity: 1; transform: translate(-50%, 0); }
 .cp-skeletons { display: grid; gap: 14px; }
 .cp-skeleton { height: 118px; border-radius: 16px; background: var(--side); border: 1px solid var(--line); opacity: .55; animation: cp-pulse 1.4s ease-in-out infinite; }
 @keyframes cp-pulse { 50% { opacity: .25; } }
+
+/* ── The wallet gate, and the book grid beside the charts ── */
+.cp-wallet-strip {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin-top: 12px; padding: 11px 14px;
+  border: 1px solid var(--line); border-left: 2px solid var(--ember);
+  border-radius: 0 12px 12px 0; background: var(--soft);
+  color: var(--mute); font-size: 11.5px; line-height: 1.6;
+}
+.cp-wallet-strip svg { color: var(--ember); flex: none; }
+.cp-wallet-amount { display: flex; align-items: baseline; gap: 8px; flex: none; }
+.cp-wallet-amount small { color: var(--dim); font-size: 10px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }
+.cp-wallet-amount b { color: var(--ink); font-size: 14px; }
+.cp-wallet-note { flex: 1 1 320px; min-width: 0; }
+.cp-book-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; margin-top: 16px; }
+.cp-page .activity-panel .tw table { min-width: 520px; }
+@media (min-width: 1500px) { .cp-book-grid { grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); } }
 
 /* ── Detail pane: candlestick chart tab ─────────────── */
 .cp-chart-head { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; justify-content: space-between; margin-bottom: 12px; }

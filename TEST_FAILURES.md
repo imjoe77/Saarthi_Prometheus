@@ -5,7 +5,18 @@ in one place so they can all be fixed at the end of the project. Anything listed
 under `OPEN` must be fixed before the project is called complete; anything under
 `RESOLVED` is history and needs no action.
 
-Last updated: **2026-10-28** (full-suite run after the role/auth rework: the
+Last updated: **2026-10-31** (the **copy trading** work: Module 07's engine switched from
+BUY/SELL to **LONG/SHORT** with directional positions, the paper module gained live
+marking and a close-position route, and both engines now gate a fill on the caller's
+real USDT balance. The unit snapshot below was re-verified green on 2026-10-31; the
+e2e run is now **676 / 683** with two open failures, one of them new — see **OPEN-3**).
+
+Previously **2026-10-31** (the admin **USDT distribution** surface: new
+`GET /api/liquidity/distribution`, PLATFORM_ADMIN-only and read-only, with 3
+new unit cases and 2 new e2e cases in the liquidity suites — liquidity alone is
+now **15 / 15**; the unit snapshot below was re-verified green on 2026-10-31).
+
+Previously **2026-10-28** (full-suite run after the role/auth rework: the
 login page now offers a fourth, env-only **Platform Admin** card; every persona
 card scopes the session to its own surface ("one click, one surface"); and a
 Gmail address may hold only **one** privileged role, refused through the
@@ -17,9 +28,9 @@ existing denial flow with a "try a different account" message).
 
 | Suite | Command | Result |
 |---|---|---|
-| Backend unit | `cd backend && npx jest --silent` | **945 / 945 passed** in 61 suites (was 932; +13 covering the one-privileged-role rule (`rbac.service.spec.ts`, 11 new) and the persona-narrowing rule now treating `PLATFORM_ADMIN` as an ordinary persona (`auth.service.spec.ts`, 9 → 11)) |
+| Backend unit | `cd backend && npx jest --silent` | **978 / 978 passed** in 63 suites (re-verified 2026-10-31; was 945 in 61 suites at the 2026-10-28 run. +3 here: the `getDistribution()` coverage in `liquidity.service.spec.ts`, 5 → 8. The remaining +30 / +2 suites are the concurrent payments and liquidity-DTO work merged the same day — every suite green, no assertion weakened) |
 | Backend typecheck | `cd backend && npm run typecheck` | **clean** |
-| Backend e2e | `cd backend && npm run test:e2e` | **635 / 638 passed** — 638 because `rbac.e2e-spec.ts` grew 50 → 53. The three failures are OPEN-1 below (**failed as predicted**: this run happened ~15:30 UTC, inside the US cash session), OPEN-2 below, and one sentinel expiry test that flaked on its 15s timeout under full-run load — re-run alone it is **25 / 25 green**, i.e. contention, not a defect. The rbac suite itself passed inside this run. The USDT suites pass in the full run (they were **61 / 61** and liquidity **13 / 13** when run alone on 2026-10-27) |
+| Backend e2e | `cd backend && npm run test:e2e` | **676 / 683 passed** — 683 because the copy and paper suites grew with the LONG/SHORT work. The 7 failures are OPEN-2 below (the stale Sepolia mint row, unchanged) and OPEN-3 below (**new**: the AI doubt solver, 6 failures). The copy suite is **green** (`copy` + `paper` = **62 / 62**), the sentinel expiry test was green in this run, and the unit suites stayed green |
 | Frontend | `npm test`, `npx tsc --noEmit`, `npx eslint .`, `npx next build` | **`npm test` 15/15; tsc clean; build green**. Repo-wide lint reports **6 errors, 36 warnings**, **none in a file this task touched**: 2 are the known `no-require-imports` in `blockchain/scripts/derive-address.js`; 4 are `react-hooks` findings in `app/copy-trading/page.tsx` (2 × `set-state-in-effect`) and `components/CopyActivityChart.tsx` (2 × `refs`), outside the role/auth, USDT and design work. `app/page.tsx` — edited here to mount the denial notice — is **not** among them, and lint is clean on every file this task touched (`LoginForm`, `LoginContinue`, `AccessDeniedNotice`, `app/page.tsx`, `lib/login-flow`, `lib/auth`, `lib/api-token`, `lib/api-client`, `types/next-auth.d.ts`). `public/**` is an explicit ignore (browser-shipped widget scripts — see `eslint.config.mjs`).
 
 Backend lint (`cd backend && npm run lint`) reports **141 pre-existing
@@ -55,9 +66,9 @@ option A, B or C is applied. Do not read a green e2e run as OPEN-1 being
 resolved.
 
 No test is skipped, `xit`, `only` or `todo` anywhere in the repository
-(searched 2026-10-12): the two OPEN entries below are the only outstanding
+(searched 2026-10-12): the OPEN entries below are the only outstanding
 **failures**; the sentinel timeout noted in the snapshot is a load flake
-(reproduced green in isolation), not a third open defect.
+(reproduced green in isolation), not an open defect.
 
 Module 13 baseline moves (all additive, no old assertions weakened):
 
@@ -201,6 +212,67 @@ the 503 refusal path itself passes.
 
 ---
 
+## OPEN-3 — `ai-doubt-solver.e2e-spec.ts`: the widget suite cannot answer
+
+**Status:** OPEN — environment-dependent, not a code defect. First observed
+2026-10-31; the health-probe case was already failing before that, and the
+five answer cases fail whenever the configured model provider is not reachable
+from the machine running the suite.
+
+**Location:** `backend/test/ai-doubt-solver.e2e-spec.ts` — five cases under
+`POST /api/ai-doubt-solver`, plus `GET /api/health (widget status probe)`.
+
+**Exact failures (2026-10-31, standalone run):**
+
+```
+● AI doubt solver (e2e) › POST /api/ai-doubt-solver › answers a covered question with the widget contract
+  thrown: "Exceeded timeout of 15000 ms for a test."
+
+● AI doubt solver (e2e) › GET /api/health (widget status probe) › reports the AI provider as configured and names the answer source
+  expect(received).toBe(expected) // Object.is equality
+  Expected: "knowledge-base"
+  Received: "model"
+```
+
+**Root cause — two separate facts, one environment.**
+
+1. The local `backend/.env` sets **`AI_MODEL_URL`**. `health.service.ts:51`
+   reports the answer source as `aiProvider: this.config.aiModelUrl ?
+   'model' : 'knowledge-base'`, so the health probe sees `'model'` while the
+   test expects the no-model value `'knowledge-base'`. The test's premise —
+   "no model configured, so the answer comes from the knowledge base" — is
+   false on a machine that configures one.
+2. `ai-doubt-solver.service.ts:77` calls that model URL with
+   `AbortSignal.timeout(this.config.aiModelTimeoutMs)`, and
+   `app.config.ts:771` defaults **`AI_MODEL_TIMEOUT_MS` to 20_000**. When the
+   provider is unreachable, each request therefore hangs for 20 s before the
+   knowledge-base fallback can run — while jest's per-test budget is **15 s**.
+   The five answer cases time out first, so the fallback never gets a chance
+   to answer. The service is fine; the two budgets are simply incompatible
+   when the provider is down.
+
+**Repro:**
+
+```powershell
+cd backend
+npm run test:e2e -- --testPathPatterns=ai-doubt-solver
+# 19 passed, 6 failed while the configured model provider is unreachable.
+```
+
+**Fix options (decide when fixing):**
+
+| # | Option | Touches | Trade-off |
+|---|---|---|---|
+| **A (recommended)** | Lower `AI_MODEL_TIMEOUT_MS` below the test budget (e.g. `8000`) in the e2e env, so the fallback answers inside 15 s | e2e env only | Keeps the fallback path under test; the answer cases then pass even with the provider down. The health-probe case still needs B or C. |
+| B | Make the health probe assert the provider the environment actually configures (`process.env.AI_MODEL_URL ? 'model' : 'knowledge-base'`) | 1 test file | The probe then tests the real contract rather than a hard-coded provider. Weakens nothing that matters: it still proves the probe *names* the source in use. |
+| C | Run the suite with `AI_MODEL_URL` unset | e2e env only | Restores the original premise exactly; the model path then goes untested here (it has its own unit coverage in `ai-doubt-solver.service.spec.ts`). |
+
+**Why deferred:** the three fixes touch the e2e environment or a frozen test,
+and which one to take is a project decision. Nothing about the copy-trading
+work depends on this suite.
+
+---
+
 ## Known caveats locked into PASSING tests (not failures, but worth revisiting)
 
 These pass today and need no fix; they are recorded so nobody mistakes them for
@@ -264,9 +336,10 @@ future regression of any of these is recognizable:
 - [ ] **OPEN-1** — decide option A, B or C (needs approval to touch frozen 06c), apply, then re-run:
   ```powershell
   cd backend
-  npm run test:e2e                        # must be 638/638 (with OPEN-2 fixed too)
-  npx jest --silent                       # must stay 945/945
+  npm run test:e2e                        # must be 683/683 (with OPEN-2 and OPEN-3 fixed too)
+  npx jest --silent                       # must stay 978/978
   ```
 - [ ] **OPEN-2** — clear the stale Sepolia mint row (or scope the assertion), then re-run `ember-ecosystem`.
+- [ ] **OPEN-3** — decide option A, B or C for the AI doubt solver, then re-run `ai-doubt-solver`.
 - [ ] Re-run outside and inside US market hours to confirm the fix removed the time dependency.
 - [ ] Optional: silence the unit-runner teardown warning (`.unref()` on the leaking timer).

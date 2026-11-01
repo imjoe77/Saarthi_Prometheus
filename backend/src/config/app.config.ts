@@ -35,6 +35,13 @@ export class AppConfig {
   readonly payments: PaymentsConfig;
   /** POST endpoint of a locally trained model for the trade-buddy widget; null = built-in knowledge base only. */
   readonly aiModelUrl: string | null;
+  /**
+   * How long the model gets before the request is abandoned for the knowledge
+   * base. Bounded by the layers above it: the BFF proxy waits 25s and the
+   * widget aborts its own fetch at 30s, so a value at or beyond those would
+   * let the backend hold a request the frontend has already given up on.
+   */
+  readonly aiModelTimeoutMs: number;
 
   constructor(init: Partial<AppConfig>) {
     this.nodeEnv = init.nodeEnv ?? 'development';
@@ -61,6 +68,7 @@ export class AppConfig {
     this.sentinel = init.sentinel ?? new SentinelConfig({});
     this.payments = init.payments ?? new PaymentsConfig({});
     this.aiModelUrl = init.aiModelUrl ?? null;
+    this.aiModelTimeoutMs = init.aiModelTimeoutMs ?? 20_000;
   }
 
   get isProduction(): boolean {
@@ -236,6 +244,16 @@ export class TokenomicsConfig {
   readonly adaptiveLowerHealthPct: number;
   readonly adaptiveMinBurnPct: number;
 
+  /**
+   * Module 08 x Module 11 integration - how much of a settled USDT order is
+   * attributed to Prometheus as revenue and fed into the burn/buyback engine.
+   */
+  readonly exchangeRevenueMode: ExchangeRevenueMode;
+  readonly exchangeRevenueBps: number;
+  readonly exchangeRevenueWorkerEnabled: boolean;
+  readonly exchangeRevenueWorkerIntervalMs: number;
+  readonly exchangeRevenueMaxAttempts: number;
+
   constructor(init: Partial<TokenomicsConfig>) {
     this.directBurnPct = init.directBurnPct ?? 60;
     this.buybackPct = init.buybackPct ?? 40;
@@ -243,6 +261,11 @@ export class TokenomicsConfig {
     this.adaptiveUpperHealthPct = init.adaptiveUpperHealthPct ?? 45;
     this.adaptiveLowerHealthPct = init.adaptiveLowerHealthPct ?? 31;
     this.adaptiveMinBurnPct = init.adaptiveMinBurnPct ?? 40;
+    this.exchangeRevenueMode = init.exchangeRevenueMode ?? 'NONE';
+    this.exchangeRevenueBps = init.exchangeRevenueBps ?? 10_000;
+    this.exchangeRevenueWorkerEnabled = init.exchangeRevenueWorkerEnabled ?? true;
+    this.exchangeRevenueWorkerIntervalMs = init.exchangeRevenueWorkerIntervalMs ?? 15_000;
+    this.exchangeRevenueMaxAttempts = init.exchangeRevenueMaxAttempts ?? 12;
 
     const valid = (value: number): boolean => Number.isInteger(value) && value >= 0 && value <= 100;
     if (!valid(this.directBurnPct) || !valid(this.buybackPct)) {
@@ -280,8 +303,49 @@ export class TokenomicsConfig {
         'TOKENOMICS_ADAPTIVE_MIN_BURN_PCT must not exceed the configured baseline direct-burn percentage; the baseline is the most protective state the policy can dial DOWN from.',
       );
     }
+
+    if (!Number.isInteger(this.exchangeRevenueBps) || this.exchangeRevenueBps < 0 || this.exchangeRevenueBps > 10_000) {
+      throw new Error(
+        'TOKENOMICS_EXCHANGE_REVENUE_BPS must be an integer between 0 and 10000 (basis points of retained INR).',
+      );
+    }
+    if (this.exchangeRevenueWorkerIntervalMs < 250) {
+      throw new Error('TOKENOMICS_EXCHANGE_WORKER_INTERVAL_MS must be at least 250ms.');
+    }
+    if (!Number.isInteger(this.exchangeRevenueMaxAttempts) || this.exchangeRevenueMaxAttempts < 1) {
+      throw new Error('TOKENOMICS_EXCHANGE_MAX_ATTEMPTS must be a positive integer.');
+    }
   }
 }
+
+/**
+ * How the exchange-to-tokenomics integration sizes a settled USDT order.
+ *
+ * `NONE` is the default: nothing is queued, and every settled order is recorded
+ * with the reason it was skipped.
+ *
+ * `RETAINED_BPS` attributes a fraction of what a settlement actually leaves
+ * behind. It is a cap, not a target: the policy can never claim more than
+ * `customer INR - LP INR`, so switching it on changes nothing until the
+ * exchange genuinely collects a fee, and it cannot over-claim once one exists.
+ *
+ * `VOLUME_LINKED` sizes the engine on the order's own INR value instead: that
+ * value is converted to EMBER at the configured distribution price and split by
+ * the adaptive policy. It is a *sizing basis, not an income claim* - the rupees
+ * are not routed anywhere by this decision, no fee is charged, and neither the
+ * customer nor a liquidity provider is debited a further amount. What does leave
+ * is EMBER, from the treasury's own inventory, under the same 30% reserve floor
+ * and available-balance guardrail as any other burn. `revenue_inr` therefore
+ * stays zero in this mode while `basis_inr` carries the volume, so the ledger
+ * can always be re-read years later without this integration having asserted a
+ * revenue that never existed.
+ *
+ * The consequence of choosing it is worth stating plainly: burns become a
+ * function of trading turnover rather than of earnings, so supply falls at a
+ * rate the platform sets by choosing the reference price and the split, and the
+ * treasury is the source. It is deflation by policy, funded by inventory.
+ */
+export type ExchangeRevenueMode = 'NONE' | 'RETAINED_BPS' | 'VOLUME_LINKED';
 
 /**
  * Treasury guardrail settings (Module 12).
@@ -689,6 +753,14 @@ export function createAppConfig(raw: Readonly<Record<string, unknown>>): AppConf
       adaptiveUpperHealthPct: toInt(raw['TOKENOMICS_ADAPTIVE_HEALTH_UPPER_PCT'], 45),
       adaptiveLowerHealthPct: toInt(raw['TOKENOMICS_ADAPTIVE_HEALTH_LOWER_PCT'], 31),
       adaptiveMinBurnPct: toInt(raw['TOKENOMICS_ADAPTIVE_MIN_BURN_PCT'], 40),
+      exchangeRevenueMode: parseExchangeRevenueMode(raw['TOKENOMICS_EXCHANGE_REVENUE_MODE']),
+      exchangeRevenueBps: toInt(raw['TOKENOMICS_EXCHANGE_REVENUE_BPS'], 10_000),
+      exchangeRevenueWorkerEnabled: parseBoolean(
+        raw['TOKENOMICS_EXCHANGE_WORKER_ENABLED'],
+        (raw['NODE_ENV'] as string) !== 'test',
+      ),
+      exchangeRevenueWorkerIntervalMs: toInt(raw['TOKENOMICS_EXCHANGE_WORKER_INTERVAL_MS'], 15_000),
+      exchangeRevenueMaxAttempts: toInt(raw['TOKENOMICS_EXCHANGE_MAX_ATTEMPTS'], 12),
     }),
     treasury: new TreasuryConfig({
       monthlyCapacityInr: resolveOptionalPositiveAmount(raw['TREASURY_MONTHLY_CAPACITY_INR']),
@@ -753,6 +825,7 @@ export function createAppConfig(raw: Readonly<Record<string, unknown>>): AppConf
     // Empty string is the common "unset" form in a copied .env line; it means
     // no model configured, not a URL of "".
     aiModelUrl: (raw['AI_MODEL_URL'] as string | undefined)?.trim() || null,
+    aiModelTimeoutMs: toInt(raw['AI_MODEL_TIMEOUT_MS'], 20_000),
   });
 }
 
@@ -917,4 +990,20 @@ function parseBoolean(value: unknown, fallback: boolean): boolean {
   if (typeof value === 'boolean') return value;
   if (typeof value === 'string') return value.toLowerCase() === 'true';
   return fallback;
+}
+
+/**
+ * An unrecognised mode reads as `NONE`, never as `RETAINED_BPS`: the safe
+ * default is the one that burns nothing, and a typo in an env file must not be
+ * what selects the destructive path.
+ */
+function parseExchangeRevenueMode(value: unknown): ExchangeRevenueMode {
+  if (typeof value !== 'string') return 'NONE';
+
+  const normalised = value.toUpperCase();
+
+  if (normalised === 'RETAINED_BPS') return 'RETAINED_BPS';
+  if (normalised === 'VOLUME_LINKED') return 'VOLUME_LINKED';
+
+  return 'NONE';
 }

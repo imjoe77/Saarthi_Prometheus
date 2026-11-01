@@ -3,6 +3,7 @@ import { Module } from '@nestjs/common';
 import { APP_CONFIG, AppConfigModule, type AppConfig } from '../../config/config.module';
 import { LiquidityModule } from '../liquidity/liquidity.module';
 import { WalletModule } from '../wallet/wallet.module';
+import { TokenomicsModule } from '../tokenomics/tokenomics.module';
 import { FakeUsdtPricingProvider } from './providers/fake-usdt-pricing.provider';
 import { LiveUsdtPricingProvider } from './providers/live-usdt-pricing.provider';
 import {
@@ -29,7 +30,7 @@ import { UsdtService } from './usdt.service';
  * NODE_ENV=test, so no test ever needs network access or credentials).
  */
 @Module({
-  imports: [AppConfigModule, WalletModule, LiquidityModule],
+  imports: [AppConfigModule, WalletModule, LiquidityModule, TokenomicsModule],
   controllers: [UsdtController],
   providers: [
     UsdtService,

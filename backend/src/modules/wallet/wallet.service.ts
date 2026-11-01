@@ -142,6 +142,40 @@ export class WalletService {
   }
 
   /**
+   * One asset's available balance, or zero when the user has no wallet or no
+   * balance in that asset.
+   *
+   * ZERO IS A REAL ANSWER HERE, NOT A MISSING ONE. This read exists to answer
+   * "can this user afford X?", and a user with no USDT balance can afford
+   * nothing - which is a different fact from "we do not know what they can
+   * afford". Throwing a 404 for the first and reporting zero for the second
+   * would make the caller guess which case it is looking at.
+   *
+   * `client` joins an outer transaction, so a caller that is deciding inside
+   * its own transaction reads the balance through that same transaction.
+   */
+  async getAvailableBalance(
+    userId: string,
+    assetSymbol: string,
+    client?: Prisma.TransactionClient,
+  ): Promise<Prisma.Decimal> {
+    const run = async (tx: Prisma.TransactionClient): Promise<Prisma.Decimal> => {
+      const wallet = await tx.wallet.findUnique({ where: { userId } });
+      if (wallet === null) {
+        return new Prisma.Decimal(0);
+      }
+
+      const balance = await tx.walletBalance.findFirst({
+        where: { walletId: wallet.id, asset: { symbol: assetSymbol } },
+      });
+
+      return balance === null ? new Prisma.Decimal(0) : balance.available;
+    };
+
+    return client ? run(client) : this.prisma.$transaction(run);
+  }
+
+  /**
    * One keyset page of the wallet's ledger, newest first.
    *
    * Fetches `limit + 1` rows to learn whether another page exists without a

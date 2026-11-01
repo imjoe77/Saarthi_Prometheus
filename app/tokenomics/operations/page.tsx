@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import {
   AlertTriangle,
@@ -26,10 +26,15 @@ import {
   createTokenBuyback,
   executeTokenBuyback,
   getEmberSupply,
+  getExchangeRevenue,
   getTokenomicsConfig,
   getTokenomicsRecords,
   previewTokenAllocation,
+  runExchangeRevenueOnce,
   type EmberSupply,
+  type ExchangeRevenueBurnRef,
+  type ExchangeRevenueEventRecord,
+  type ExchangeRevenueSummary,
   type TokenomicsConfig,
   type TokenomicsPreview,
   type TokenomicsRecords,
@@ -39,8 +44,9 @@ import {
  * MODULE 11 — the EMBER tokenomics page.
  *
  * Every figure on this page comes from the BFF: the configured split
- * (GET /tokenomics/config), the ledger-derived supply (GET /ember/supply) and
- * the caller's own records (GET /tokenomics/records). The split calculator
+ * (GET /tokenomics/config), the ledger-derived supply (GET /ember/supply),
+ * the caller's own records (GET /tokenomics/records) and the platform-wide
+ * exchange feed (GET /tokenomics/exchange-revenue). The split calculator
  * posts to /tokenomics/preview, which computes server-side and persists
  * nothing; a record is written only when the user explicitly asks for one.
  *
@@ -60,21 +66,52 @@ import {
 
 type LoadStatus = "loading" | "ready" | "error";
 
+/** Which of the page's four reads failed, each mapped to the API's own words. */
+type SnapshotFailures = Partial<Record<"config" | "supply" | "records" | "exchangeRevenue", string>>;
+
 interface TokenomicsSnapshot {
-  config: TokenomicsConfig;
-  supply: EmberSupply;
+  config: TokenomicsConfig | null;
+  supply: EmberSupply | null;
   records: TokenomicsRecords;
+  exchangeRevenue: ExchangeRevenueSummary | null;
+  failures: SnapshotFailures;
 }
 
-/** Reads the whole tokenomics view. Sets no state, so an effect can call it freely. */
+/**
+ * Reads the whole tokenomics view. Sets no state, so an effect can call it freely.
+ *
+ * The four reads are settled independently rather than awaited together. Under
+ * `nest start --watch` the backend restarts on every save, and a page that
+ * demands all four at once blanks completely for a blip that clears in seconds.
+ * Each section now shows its own failure and the rest of the page keeps working.
+ */
 async function fetchSnapshot(): Promise<TokenomicsSnapshot> {
-  const [config, supply, records] = await Promise.all([
+  const [config, supply, records, exchangeRevenue] = await Promise.allSettled([
     getTokenomicsConfig(),
     getEmberSupply(),
     getTokenomicsRecords(),
+    getExchangeRevenue(20),
   ]);
 
-  return { config, supply, records };
+  const failures: SnapshotFailures = {};
+
+  const take = <T,>(
+    key: keyof SnapshotFailures,
+    result: PromiseSettledResult<T>,
+    fallback: T,
+  ): T => {
+    if (result.status === "fulfilled") return result.value;
+    failures[key] = messageFor(result.reason);
+    return fallback;
+  };
+
+  return {
+    config: take("config", config, null),
+    supply: take("supply", supply, null),
+    records: take("records", records, { allocations: [], buybacks: [], burns: [] }),
+    exchangeRevenue: take("exchangeRevenue", exchangeRevenue, null),
+    failures,
+  };
 }
 
 function messageFor(error: unknown): string {
@@ -83,6 +120,25 @@ function messageFor(error: unknown): string {
   }
 
   return "Something went wrong while talking to the Prometheus API.";
+}
+
+/**
+ * Waits before each successive snapshot read, in milliseconds.
+ *
+ * The backend runs under `nest start --watch`, which restarts it on every source
+ * save; port 3001 stays closed for the whole rebuild-and-bootstrap window, five
+ * to twenty seconds here. The proxy absorbs a sub-second race, this absorbs a
+ * restart. Without it the page reports "the API is not reachable" about something
+ * that was already coming back, and every reload during a save looks like a
+ * failure to whoever is watching the screen.
+ *
+ * The budget is finite on purpose: after about a minute the page says the API is
+ * unreachable rather than spinning forever, because at that point it genuinely is.
+ */
+const SNAPSHOT_RETRY_DELAYS_MS = [0, 1_500, 3_000, 5_000, 9_000, 15_000, 25_000] as const;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** Groups an integer part and trims the fraction for display only. */
@@ -172,6 +228,9 @@ export default function TokenomicsPage() {
     buybacks: [],
     burns: [],
   });
+  // Platform-wide, unlike `records`: the exchange feed spans every account's
+  // settled orders, and the backend read is not filtered by caller.
+  const [exchangeRevenue, setExchangeRevenue] = useState<ExchangeRevenueSummary | null>(null);
 
   // Preview calculator (computation only, never a record).
   const [referenceAmount, setReferenceAmount] = useState("80000");
@@ -195,6 +254,15 @@ export default function TokenomicsPage() {
   // When the snapshot was read, so the hero can show the figures are live
   // rather than static. Clock read happens in the callback, not in render.
   const [loadedAt, setLoadedAt] = useState<number | null>(null);
+  // Reads that failed while the rest of the page loaded. Each one degrades its
+  // own section instead of taking the whole view down with it.
+  const [unavailable, setUnavailable] = useState<SnapshotFailures>({});
+  // Which attempt in the retry budget the page is on, or null once it settled.
+  // Lets a restart look like what it is - a wait - rather than a dead page.
+  const [retrying, setRetrying] = useState<{ attempt: number; total: number } | null>(null);
+  // Bumped by every new load and by unmount; an in-flight loop checks it after
+  // each await, so a cancelled load can no longer write state.
+  const loadRun = useRef(0);
 
   const applySnapshot = useCallback((snapshot: TokenomicsSnapshot) => {
     const cutoff = Date.now() - 24 * 60 * 60 * 1_000;
@@ -205,45 +273,82 @@ export default function TokenomicsPage() {
     setConfig(snapshot.config);
     setSupply(snapshot.supply);
     setRecords(snapshot.records);
+    setExchangeRevenue(snapshot.exchangeRevenue);
+    setUnavailable(snapshot.failures);
     setCallerBurn24h(burned24h);
     setLoadedAt(Date.now());
+
+    // The hero, the supply map and the operations panel all derive from these
+    // two reads. With either gone there is nothing to degrade to, so the page
+    // says so rather than rendering a half-truth.
+    if (!snapshot.config || !snapshot.supply) {
+      setError(snapshot.failures.config ?? snapshot.failures.supply ?? null);
+      setStatus("error");
+      return;
+    }
+
+    setError(null);
     setStatus("ready");
   }, []);
 
-  const load = useCallback(async () => {
-    applySnapshot(await fetchSnapshot());
-  }, [applySnapshot]);
+  /**
+   * Reads the whole view, retrying with backoff while any read is missing.
+   *
+   * A partially loaded page is still a page. As soon as the two reads the layout
+   * is built on - config and supply - are back, they are rendered and only the
+   * sections that failed keep being retried; the reader sees real figures
+   * immediately instead of waiting for the slowest endpoint. Nothing is applied
+   * while config or supply is still missing, because there is no honest partial
+   * view without them, and the retry banner says why.
+   */
+  const load = useCallback(
+    async (mode: "retry" | "single" = "retry") => {
+      const delays: readonly number[] = mode === "retry" ? SNAPSHOT_RETRY_DELAYS_MS : [0];
+      const run = (loadRun.current += 1);
+
+      for (let attempt = 0; attempt < delays.length; attempt += 1) {
+        // Yielded even when the delay is zero: state is never written in the
+        // same tick the effect ran, so the first load reads as a subscription
+        // to the API rather than a render that cascades into another render.
+        await sleep(delays[attempt]);
+        if (run !== loadRun.current) return;
+
+        const snapshot = await fetchSnapshot();
+        if (run !== loadRun.current) return;
+
+        const failed = Object.keys(snapshot.failures).length;
+        const renderable = Boolean(snapshot.config && snapshot.supply);
+        const exhausted = attempt === delays.length - 1;
+
+        if (failed === 0 || renderable || exhausted) applySnapshot(snapshot);
+        if (failed === 0 || exhausted) {
+          setRetrying(null);
+          return;
+        }
+
+        setRetrying({ attempt: attempt + 2, total: SNAPSHOT_RETRY_DELAYS_MS.length });
+      }
+    },
+    [applySnapshot],
+  );
 
   useEffect(() => {
-    let active = true;
-
-    // State is applied inside the promise callback, never synchronously in the
-    // effect body, so this reads as a subscription rather than a render that
-    // cascades into another.
-    fetchSnapshot()
-      .then((snapshot) => {
-        if (active) applySnapshot(snapshot);
-      })
-      .catch((snapshotError: unknown) => {
-        if (active) {
-          setError(messageFor(snapshotError));
-          setStatus("error");
-        }
-      });
+    // `load` is started from a promise callback rather than directly in the
+    // effect body, and it yields before its first write, so nothing is set
+    // while React is still running this effect: the page subscribes to the API
+    // instead of cascading one render into the next.
+    void Promise.resolve().then(() => load());
 
     return () => {
-      active = false;
+      loadRun.current += 1;
     };
-  }, [applySnapshot]);
+  }, [load]);
 
   const refresh = useCallback(() => {
     setError(null);
     setNotice(null);
     setStatus("loading");
-    void load().catch((loadError: unknown) => {
-      setError(messageFor(loadError));
-      setStatus("error");
-    });
+    void load();
   }, [load]);
 
   const runAction = useCallback(
@@ -254,7 +359,11 @@ export default function TokenomicsPage() {
 
       try {
         setNotice(await action());
-        await load();
+        // One read, no retry budget: the action itself just succeeded, so the
+        // API is demonstrably up, and holding `busy` through a minute of
+        // backoff would lock the panel for a refresh that can be retried by
+        // hand if it is ever needed.
+        await load("single");
       } catch (actionError) {
         setError(messageFor(actionError));
       } finally {
@@ -346,6 +455,18 @@ export default function TokenomicsPage() {
         return next;
       });
       return "Burn recorded for the executed quantity. The treasury was debited and circulating supply fell by exactly that quantity.";
+    });
+  };
+
+  /**
+   * Drain the settled-order queue now. The same code the background worker runs,
+   * so it is a schedule shortcut rather than a different path — and it drives
+   * burns, which is why the backend gates it to PLATFORM_ADMIN.
+   */
+  const handleRunExchangePass = () => {
+    void runAction("exchange-pass", async () => {
+      const { processed } = await runExchangeRevenueOnce();
+      return `Exchange revenue pass finished — ${processed} order${processed === 1 ? "" : "s"} newly taken from the queue. Orders already completed are not re-processed, and orders blocked by a treasury guardrail report the same refusal.`;
     });
   };
 
@@ -461,6 +582,18 @@ export default function TokenomicsPage() {
           </p>
         </div>
 
+        {retrying && (
+          <div className="mb-4 flex items-center gap-3 rounded-[14px] border border-[#ffb020]/30 bg-[#ffb020]/5 p-4">
+            <Loader2 className="h-4 w-4 shrink-0 animate-spin text-[#ffb020]" />
+            <p className="flex-1 text-xs text-[#c5cfde]">
+              The Prometheus API is restarting — it refuses connections for a few seconds whenever
+              the backend rebuilds, which is normal in development. Retrying automatically (attempt{" "}
+              {retrying.attempt} of {retrying.total}); this page will fill itself in when it comes
+              back.
+            </p>
+          </div>
+        )}
+
         {error && (
           <div className="mb-4 flex items-start gap-3 rounded-[14px] border border-[#ff6a1a]/30 bg-[#ff6a1a]/5 p-4">
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-[#ff6a1a]" />
@@ -515,18 +648,69 @@ export default function TokenomicsPage() {
               <SupplyLegend supply={supply} active={activeSlice} onActivate={setActiveSlice} />
             </div>
 
+            {/* MODULE 08 x MODULE 11 — the exchange feed */}
+            <SectionHead
+              title="Exchange revenue feed"
+              description="What settled USDT buy orders have handed the buyback & burn engine, platform-wide."
+              right={
+                <div className="flex flex-wrap items-center gap-2">
+                  {exchangeRevenue && (
+                    <span className="eh-chip eh-chip-muted">
+                      Platform-wide · latest {exchangeRevenue.recent.length}
+                    </span>
+                  )}
+                  {isAdmin && (
+                    <button
+                      type="button"
+                      onClick={handleRunExchangePass}
+                      disabled={busy !== null}
+                      className="inline-flex items-center gap-1.5 rounded-[9px] border border-[#24272f] bg-[#1a1d23] px-3 py-1.5 text-[12px] font-bold text-white transition hover:bg-[#23262d] disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {busy === "exchange-pass" ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <RefreshCw className="h-3.5 w-3.5" />
+                      )}
+                      Run one pass now
+                    </button>
+                  )}
+                </div>
+              }
+            />
+            {exchangeRevenue ? (
+              <>
+                <ExchangeRevenueCard summary={exchangeRevenue} supply={supply} />
+                <ExchangeRevenueLedger
+                  recent={exchangeRevenue.recent}
+                  isVolumeBasis={exchangeRevenue.policy.mode === "VOLUME_LINKED"}
+                />
+              </>
+            ) : (
+              <ReadUnavailable
+                what="the exchange revenue feed"
+                message={unavailable.exchangeRevenue ?? "Not read."}
+              />
+            )}
+
             <SectionHead
               title="Burn telemetry"
               description="Your recorded burns, read straight from this account's tokenomics records."
               right={<span className="eh-chip eh-chip-green">Per-account · latest 50</span>}
             />
             <div className="grid gap-4 lg:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)]">
-              <BurnActivityCard
-                records={records}
-                total={callerBurnTotal}
-                last24h={callerBurn24h}
-                recent={recentBurns}
-              />
+              {unavailable.records ? (
+                <ReadUnavailable
+                  what="this account's tokenomics records"
+                  message={unavailable.records}
+                />
+              ) : (
+                <BurnActivityCard
+                  records={records}
+                  total={callerBurnTotal}
+                  last24h={callerBurn24h}
+                  recent={recentBurns}
+                />
+              )}
               <SupplyFacts supply={supply} config={config} />
             </div>
 
@@ -559,16 +743,23 @@ export default function TokenomicsPage() {
                 </div>
               }
             />
-            <LedgerCard
-              entries={visibleEntries}
-              total={ledgerEntries.length}
-              showActions={ledgerTab === "buybacks"}
-              busy={busy}
-              burnedBuybackIds={burnedBuybackIds}
-              isAdmin={isAdmin}
-              onRecordExecution={handleRecordExecution}
-              onBurnBuyback={handleBurnBuyback}
-            />
+            {unavailable.records ? (
+              <ReadUnavailable
+                what="the buyback & burn ledger"
+                message={unavailable.records}
+              />
+            ) : (
+              <LedgerCard
+                entries={visibleEntries}
+                total={ledgerEntries.length}
+                showActions={ledgerTab === "buybacks"}
+                busy={busy}
+                burnedBuybackIds={burnedBuybackIds}
+                isAdmin={isAdmin}
+                onRecordExecution={handleRecordExecution}
+                onBurnBuyback={handleBurnBuyback}
+              />
+            )}
 
             {/* OPERATIONS */}
             <SectionHead
@@ -702,7 +893,12 @@ export default function TokenomicsPage() {
                   <h3 className="text-sm font-bold text-white">Propose a simulated buyback</h3>
                 </div>
 
-                {records.allocations.length === 0 ? (
+                {unavailable.records ? (
+                  <p className="text-xs text-[#ffb020]">
+                    Your records could not be read, so no allocation can be chosen. The list is not
+                    empty — it is unknown. {unavailable.records}
+                  </p>
+                ) : records.allocations.length === 0 ? (
                   <p className="text-xs text-[#8a8f9b]">
                     No allocations recorded yet. Record one from the split calculator above first.
                   </p>
@@ -1311,6 +1507,501 @@ function FactRow({ label, value }: { label: string; value: string }) {
       <span className="text-[#8a8f9b]">{label}</span>
       <b className="text-right font-bold text-white">{value}</b>
     </div>
+  );
+}
+
+/**
+ * A section whose own read failed, while the rest of the page loaded.
+ *
+ * The alternative was to blank the whole page, which reports a two-second
+ * backend restart as though the tokenomics data did not exist. Here the number
+ * is replaced by an explicit "not read", so an empty figure can never be
+ * mistaken for a zero: a burn total that was never fetched and a burn total of
+ * zero have to look different on screen.
+ */
+function ReadUnavailable({ what, message }: { what: string; message: string }) {
+  return (
+    <div className="rounded-[10px] border border-dashed border-[#2c3038] p-6">
+      <div className="flex items-start gap-2.5">
+        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-[#ffb020]" />
+        <div>
+          <p className="text-xs font-semibold text-[#eceef2]">
+            {what.charAt(0).toUpperCase() + what.slice(1)} not loaded
+          </p>
+          <p className="mt-1 text-[11px] text-[#8a8f9b]">
+            This section was not read, so it shows nothing rather than zero. The rest of the page is
+            unaffected.
+          </p>
+          <p className="mt-2 font-mono text-[11px] text-[#ffb020]">{message}</p>
+          <p className="mt-2 text-[11px] text-[#8a8f9b]">
+            A reload once the API is back is all this needs.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * MODULE 08 x MODULE 11 — how each outbox status is described to a reader.
+ * The set is the backend's `ExchangeRevenueStatus`; nothing here invents one.
+ */
+const EXCHANGE_STATUS_ORDER = [
+  "COMPLETED",
+  "PENDING",
+  "PROCESSING",
+  "BLOCKED",
+  "FAILED",
+  "INELIGIBLE",
+] as const;
+
+const EXCHANGE_STATUS_TONE: Record<string, string> = {
+  COMPLETED: "bg-[#3ddc97]/10 text-[#3ddc97]",
+  PENDING: "bg-[#8a8f9b]/10 text-[#c5cfde]",
+  PROCESSING: "bg-[#ff6a1a]/10 text-[#ff6a1a]",
+  BLOCKED: "bg-[#ffb020]/10 text-[#ffb020]",
+  FAILED: "bg-[#ffb020]/10 text-[#ffb020]",
+  INELIGIBLE: "bg-[#5b8cff]/10 text-[#5b8cff]",
+};
+
+const EXCHANGE_STATUS_HINT: Record<string, string> = {
+  COMPLETED: "allocation, buyback, execution and both burns recorded",
+  PENDING: "revenue attributed, waiting for the next worker tick",
+  PROCESSING: "claimed by one pass right now",
+  BLOCKED: "a treasury guardrail refused the burn — retryable, never bypassed",
+  FAILED: "a non-guardrail failure outlived the retry budget",
+  INELIGIBLE: "the revenue policy attributed no INR, so nothing was queued",
+};
+
+/**
+ * Each on-chain state is labelled with what it proves. `NOT_REQUIRED` is the
+ * blockchain layer being switched off, so that EMBER left circulation on the
+ * ledger and no chain transaction exists — the page must not blur the two.
+ */
+const BURN_STATE_LABEL: Record<string, string> = {
+  NOT_REQUIRED: "Ledger only · blockchain layer off",
+  PENDING: "Chain submission pending",
+  SUBMITTED: "Submitted · awaiting confirmation",
+  CONFIRMED: "Confirmed on Sepolia",
+  FAILED: "Chain call failed",
+};
+
+const BURN_STATE_ORDER = ["CONFIRMED", "SUBMITTED", "PENDING", "NOT_REQUIRED", "FAILED"] as const;
+
+/** Sum across on-chain states. Used only to label the total, never the states. */
+function sumByChainState(byChainState: Record<string, string>): string {
+  return Object.values(byChainState).reduce(
+    (total, amount) => addDecimalStrings(total, amount),
+    "0",
+  );
+}
+
+/**
+ * A zero has several causes and they mean different things to different people.
+ * The sentence is built only from the policy and totals the API returned, so the
+ * page explains the number instead of guessing at it.
+ */
+function explainExchangeRevenue(
+  totals: ExchangeRevenueSummary["totals"],
+  policy: ExchangeRevenueSummary["policy"],
+): string {
+  if (totals.ordersSeen === 0) {
+    return "Nothing here yet: no settled USDT buy order has been put to the revenue policy. The queue is written inside the settlement transaction itself, so it records from the moment the bridge is deployed and does not backfill orders settled before it — a row written outside the transaction that moved the money would be a later judgement about the order, not a fact of it. A buy that failed, was refused or rolled back never reaches this queue at all, which is why an order you did not complete leaves no record.";
+  }
+
+  if (policy.mode === "VOLUME_LINKED") {
+    if (Number(totals.basisInr) === 0) {
+      return `${totals.ordersSeen} settled order${totals.ordersSeen === 1 ? "" : "s"} reached the policy and none contributed a rupee of volume it could be sized against, so nothing was queued.`;
+    }
+    return `Volume-linked mode: ₹${fmt(totals.basisInr)} of traded volume across ${totals.ordersSeen} settled order${totals.ordersSeen === 1 ? "" : "s"} sized the engine, and ₹${fmt(totals.revenueInr)} of it was revenue. That is not a contradiction — the rupees were never moved. Converting the volume to EMBER at the reference price gives the quantity the policy takes out of circulation, ${policy.baselineDirectBurnPct}/${policy.baselineBuybackPct} direct-burn to buyback at the baseline, and the EMBER itself comes out of the treasury's own inventory under the same reserve floor as any other burn. No fee was added to any order and nothing was deducted from a customer or a liquidity provider.`;
+  }
+
+  if (Number(totals.revenueInr) > 0) {
+    return `The policy attributed ₹${fmt(totals.revenueInr)} of the ₹${fmt(totals.retainedInr)} margin that ${totals.ordersSeen} settled order${totals.ordersSeen === 1 ? "" : "s"} left after liquidity providers were paid. Those rupees buy EMBER at the reference price and are split by the adaptive policy — the ${policy.baselineDirectBurnPct}/${policy.baselineBuybackPct} baseline is what a healthy treasury applies.`;
+  }
+
+  if (policy.mode === "NONE") {
+    return "The revenue policy is switched off (TOKENOMICS_EXCHANGE_REVENUE_MODE=NONE — the shipped default). Every settled order is recorded with its reason and nothing is queued, so the exchange cannot fund a burn until the business sets a revenue mode and a rate.";
+  }
+
+  if (Number(totals.retainedInr) === 0) {
+    return `${totals.ordersSeen} settled order${totals.ordersSeen === 1 ? "" : "s"} reached the policy and every one retained ₹0.00: the settlement pays the customer's INR out to liquidity providers to the paisa, so the platform keeps nothing to burn. That is the exchange's real economics today, not a switch — charging a fee or widening a spread is the business decision that would change it.`;
+  }
+
+  return "A margin exists, but the configured rate attributes no whole paisa of it, so no order cleared the rupee scale the engine records at.";
+}
+
+/**
+ * MODULE 08 x MODULE 11 — the exchange's contribution to the burn engine: the
+ * policy that decided the figures, the rupees a settlement actually left behind,
+ * what the allocations promised from them, and what has been destroyed.
+ *
+ * The blocks stay apart on purpose. Customer principal is not revenue, an
+ * allocation is not a burn, and a ledger burn is not a chain confirmation — one
+ * merged figure would let the page make all three claims at once.
+ *
+ * "Attributed" and "sized the engine" are also kept apart, and they only differ
+ * under VOLUME_LINKED: there the engine is measured against traded volume while
+ * the platform's income stays ₹0.00. Showing one number for both would turn
+ * turnover into revenue on the dashboard, which is the exact claim the backend
+ * split the columns to stop.
+ */
+function ExchangeRevenueCard({
+  summary,
+  supply,
+}: {
+  summary: ExchangeRevenueSummary;
+  supply: EmberSupply;
+}) {
+  const { policy, totals, byStatus } = summary;
+  const isVolumeBasis = policy.mode === "VOLUME_LINKED";
+  const backlog = EXCHANGE_STATUS_ORDER.filter(
+    (state) => state !== "COMPLETED" && state !== "INELIGIBLE",
+  ).reduce((sum, state) => sum + (byStatus[state]?.count ?? 0), 0);
+  const burnedStates = BURN_STATE_ORDER.filter(
+    (state) => totals.burnedEmberByChainState[state] !== undefined,
+  );
+
+  return (
+    <section className="eh-card p-5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-[10px] font-bold uppercase tracking-[0.13em] text-[#8a8f9b]">
+            {isVolumeBasis ? "Settled USDT orders" : "Settled USDT buy orders"}
+          </div>
+          <div className="mt-1 text-sm font-bold text-white">
+            {totals.ordersSeen} order{totals.ordersSeen === 1 ? "" : "s"} considered ·{" "}
+            {totals.eligibleOrders} funded tokenomics · {totals.allocationsRecorded} allocation
+            {totals.allocationsRecorded === 1 ? "" : "s"} recorded
+          </div>
+        </div>
+        <span className="eh-chip eh-chip-muted">GET /tokenomics/exchange-revenue · platform-wide</span>
+      </div>
+
+      <p className="mt-3 rounded-[10px] border border-[#24272f] bg-[#1a1d23] px-3 py-2.5 text-[12.5px] leading-relaxed text-[#c5cfde]">
+        {explainExchangeRevenue(totals, policy)}
+      </p>
+
+      <div className="mt-4 grid gap-4 lg:grid-cols-2">
+        <div>
+          <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] text-[#8a8f9b]">
+            Rupees behind the orders
+          </h3>
+          <div className="mt-2 grid gap-2 text-[13px]">
+            <FactRow label="Customers paid" value={`₹${fmt(totals.customerInr)}`} />
+            <FactRow label="Left as platform margin" value={`₹${fmt(totals.retainedInr)}`} />
+            <FactRow label="Claimed as revenue" value={`₹${fmt(totals.revenueInr)}`} />
+            <FactRow
+              label={isVolumeBasis ? "Traded volume sized the engine" : "Revenue-sized engine"}
+              value={`₹${fmt(totals.basisInr)}`}
+            />
+          </div>
+          <p className="mt-2 text-[11px] leading-relaxed text-[#6f7580]">
+            {isVolumeBasis ? (
+              <>
+                The engine is measured against volume, and volume is not income — the revenue line
+                above is the true ₹0.00, not a rounding. No rupee moved because of it: the same
+                settlement credited the same LPs and charged the customer the same quote, and the
+                EMBER this sizing destroys comes from the treasury&apos;s own holdings.
+              </>
+            ) : (
+              <>
+                Revenue is the margin a settlement leaves after every counterparty has been paid —
+                never the purchase amount. Customer principal and LP funds cannot reach the burn
+                engine by this path; each order&apos;s LP credit is listed per row below.
+              </>
+            )}
+          </p>
+        </div>
+
+        <div>
+          <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] text-[#8a8f9b]">
+            What the allocations promised
+          </h3>
+          <div className="mt-2 grid gap-2 text-[13px]">
+            <FactRow label="Reference amount allocated" value={`₹${fmt(totals.allocatedReferenceInr)}`} />
+            <FactRow
+              label="Direct-burn share"
+              value={`${fmt(totals.allocatedDirectBurnEmber, 4)} EMBER`}
+            />
+            <FactRow
+              label="Simulated buyback share"
+              value={`${fmt(totals.allocatedBuybackEmber, 4)} EMBER`}
+            />
+            <FactRow
+              label="EMBER actually destroyed"
+              value={`${fmt(sumByChainState(totals.burnedEmberByChainState), 4)} EMBER`}
+            />
+          </div>
+          <p className="mt-2 text-[11px] leading-relaxed text-[#6f7580]">
+            Promised and destroyed are different numbers for as long as burns are blocked or queued.
+            An allocation destroys nothing; only a burn does.
+          </p>
+        </div>
+      </div>
+
+      <div className="mt-5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] text-[#8a8f9b]">
+            Engine backlog
+          </h3>
+          <span
+            className={`rounded-full px-2.5 py-1 text-[11px] font-bold ${
+              backlog === 0 ? "bg-[#3ddc97]/10 text-[#3ddc97]" : "bg-[#ffb020]/10 text-[#ffb020]"
+            }`}
+          >
+            {backlog === 0 ? "Nothing waiting" : `${backlog} waiting`}
+          </span>
+        </div>
+
+        <div className="mt-2 flex flex-wrap gap-2">
+          {EXCHANGE_STATUS_ORDER.map((state) => {
+            const block = byStatus[state];
+            if (!block) return null;
+            return (
+              <div
+                key={state}
+                title={EXCHANGE_STATUS_HINT[state]}
+                className={`min-w-[150px] flex-1 rounded-[10px] px-3 py-2.5 ${EXCHANGE_STATUS_TONE[state]}`}
+              >
+                <div className="text-[10px] font-extrabold uppercase tracking-[0.12em]">{state}</div>
+                <div className="mt-0.5 text-sm font-bold tabular-nums">
+                  {block.count} order{block.count === 1 ? "" : "s"}
+                </div>
+                <div className="text-[11px] opacity-80">
+                  {isVolumeBasis
+                    ? `₹${fmt(block.basisInr)} sized`
+                    : `₹${fmt(block.revenueInr)} attributed`}
+                </div>
+              </div>
+            );
+          })}
+          {EXCHANGE_STATUS_ORDER.every((state) => !byStatus[state]) && (
+            <div className="grid w-full place-items-center rounded-[10px] border border-dashed border-[#2c3038] p-6 text-[11px] text-[#8a8f9b]">
+              No settled USDT order has been put to the revenue policy yet.
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="mt-5">
+        <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] text-[#8a8f9b]">
+          Engine burns by on-chain state
+        </h3>
+        <div className="mt-2 grid gap-2 text-[13px] sm:grid-cols-2">
+          {burnedStates.map((state) => (
+            <FactRow
+              key={state}
+              label={BURN_STATE_LABEL[state]}
+              value={`${fmt(totals.burnedEmberByChainState[state] ?? "0", 4)} EMBER`}
+            />
+          ))}
+          {burnedStates.length === 0 && (
+            <div className="grid place-items-center rounded-[10px] border border-dashed border-[#2c3038] p-5 text-[11px] text-[#8a8f9b] sm:col-span-2">
+              The engine has recorded no burns yet.
+            </div>
+          )}
+        </div>
+        <p className="mt-2 text-[11px] leading-relaxed text-[#6f7580]">
+          Whole-platform burn is {fmt(supply.burnedSupply, 4)} EMBER and circulating supply is{" "}
+          {fmt(supply.circulatingSupply, 2)} EMBER, both from GET /ember/supply — those count every
+          BURN leg in the ledger, not only this engine&apos;s.
+        </p>
+      </div>
+
+      <div className="mt-5 grid gap-2 text-[12.5px] sm:grid-cols-2 lg:grid-cols-4">
+        <PolicyFact
+          label="Sizing mode"
+          value={
+            policy.mode === "NONE"
+              ? "Switched off"
+              : policy.mode === "VOLUME_LINKED"
+                ? "Traded volume"
+                : `${policy.bps} bps of retained margin`
+          }
+          sub={
+            policy.mode === "VOLUME_LINKED"
+              ? "treasury-funded, no fee charged"
+              : policy.mode === "NONE"
+                ? undefined
+                : "revenue basis"
+          }
+        />
+        <PolicyFact
+          label="Baseline split"
+          value={`${policy.baselineDirectBurnPct} / ${policy.baselineBuybackPct}`}
+          sub={policy.splitIsAdaptive ? "adaptive to treasury health" : "fixed"}
+        />
+        <PolicyFact label="Reference EMBER price" value={`₹${fmt(policy.emberPrice)} per EMBER`} />
+        <PolicyFact
+          label="Background worker"
+          value={policy.workerEnabled ? "Running" : "Not running"}
+          sub={policy.workerEnabled ? "drains the queue on its tick" : "an admin pass is required"}
+        />
+      </div>
+    </section>
+  );
+}
+
+function PolicyFact({ label, value, sub }: { label: string; value: string; sub?: string }) {
+  return (
+    <div className="rounded-[10px] bg-[#1a1d23] px-3 py-2.5">
+      <div className="text-[10px] font-mono uppercase tracking-[0.1em] text-[#8a8f9b]">{label}</div>
+      <div className="mt-0.5 text-sm font-bold text-white">{value}</div>
+      {sub && <div className="text-[10.5px] text-[#6f7580]">{sub}</div>}
+    </div>
+  );
+}
+
+function ExchangeBurnCell({ burn }: { burn: ExchangeRevenueBurnRef | null }) {
+  if (!burn) {
+    return <span className="text-[#6f7580]">—</span>;
+  }
+
+  return (
+    <span
+      title={`${BURN_STATE_LABEL[burn.onChainStatus] ?? burn.onChainStatus}${burn.onChainTxHash ? ` · ${burn.onChainTxHash}` : ""}`}
+    >
+      {fmt(burn.amount, 4)}
+      <span className="ml-1 text-[10px] text-[#6f7580]">
+        {burn.onChainStatus === "CONFIRMED" ? "on-chain" : "ledger"}
+      </span>
+    </span>
+  );
+}
+
+/**
+ * One row per settled order the engine was asked to consider, keyed by its
+ * source USDT order id. A SELL and an unattributed BUY appear here as refusals
+ * with their reason; they never appear as allocations.
+ *
+ * Under a volume basis every row's revenue is ₹0.00 by design, so the last money
+ * column switches to the figure the row was actually sized against — with the
+ * revenue still one hover away, because the two must never be merged into one
+ * number that could be read either way.
+ */
+function ExchangeRevenueLedger({
+  recent,
+  isVolumeBasis,
+}: {
+  recent: ExchangeRevenueEventRecord[];
+  isVolumeBasis: boolean;
+}) {
+  return (
+    <section className="eh-card mt-4 overflow-hidden px-3.5 py-2">
+      {recent.length === 0 ? (
+        <div className="grid place-items-center rounded-[10px] border border-dashed border-[#2c3038] p-8 text-xs text-[#8a8f9b]">
+          No settled USDT order has reached the revenue policy yet.
+        </div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[1080px] border-collapse text-left">
+            <thead>
+              <tr>
+                <th className="px-2 py-2 text-xs font-medium text-[#8a8f9b]">Source order</th>
+                <th className="px-2 py-2 text-xs font-medium text-[#8a8f9b]">Settled</th>
+                <th className="px-2 py-2 text-xs font-medium text-[#8a8f9b]">Side</th>
+                <th className="px-2 py-2 text-right text-xs font-medium text-[#8a8f9b]">Paid</th>
+                <th className="px-2 py-2 text-right text-xs font-medium text-[#8a8f9b]">To LPs</th>
+                <th className="px-2 py-2 text-right text-xs font-medium text-[#8a8f9b]">Retained</th>
+                <th className="px-2 py-2 text-right text-xs font-medium text-[#8a8f9b]">
+                  {isVolumeBasis ? "Sized on" : "Attributed"}
+                </th>
+                <th className="px-2 py-2 text-right text-xs font-medium text-[#8a8f9b]">
+                  Split applied
+                </th>
+                <th className="px-2 py-2 text-right text-xs font-medium text-[#8a8f9b]">
+                  Direct burn
+                </th>
+                <th className="px-2 py-2 text-right text-xs font-medium text-[#8a8f9b]">
+                  Buyback burn
+                </th>
+                <th className="px-2 py-2 text-xs font-medium text-[#8a8f9b]">Buyback record</th>
+                <th className="px-2 py-2 text-xs font-medium text-[#8a8f9b]">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {recent.map((event) => (
+                <tr key={event.eventId} className="border-t border-[#24272f]">
+                  <td className="px-2 py-3 font-mono text-[11.5px] text-[#8a8f9b]">
+                    <span title={`USDT order ${event.orderId}`}>{shortId(event.orderId)}</span>
+                  </td>
+                  <td className="whitespace-nowrap px-2 py-3 text-[12.5px] text-[#8a8f9b]">
+                    <span title={formatTimestamp(event.detectedAt)}>
+                      {timeAgo(event.detectedAt)}
+                    </span>
+                  </td>
+                  <td className="px-2 py-3 text-[12.5px] font-bold text-white">{event.side}</td>
+                  <td className="px-2 py-3 text-right font-mono text-[12.5px] text-[#a6b2c4]">
+                    ₹{fmt(event.customerInr)}
+                  </td>
+                  <td className="px-2 py-3 text-right font-mono text-[12.5px] text-[#a6b2c4]">
+                    ₹{fmt(event.lpInrSettled)}
+                  </td>
+                  <td className="px-2 py-3 text-right font-mono text-[12.5px] text-[#a6b2c4]">
+                    ₹{fmt(event.retainedInr)}
+                  </td>
+                  <td
+                    className="px-2 py-3 text-right font-mono text-[12.5px] font-bold text-white"
+                    title={
+                      isVolumeBasis
+                        ? `Sized on ₹${fmt(event.basisInr)} of volume; ₹${fmt(event.revenueInr)} claimed as revenue`
+                        : `₹${fmt(event.revenueInr)} attributed from ₹${fmt(event.retainedInr)} retained margin`
+                    }
+                  >
+                    ₹{fmt(isVolumeBasis ? event.basisInr : event.revenueInr)}
+                  </td>
+                  <td className="px-2 py-3 text-right font-mono text-[12.5px] text-[#a6b2c4]">
+                    {event.allocation
+                      ? `${event.allocation.directBurnPct} / ${event.allocation.buybackPct}`
+                      : "—"}
+                  </td>
+                  <td className="px-2 py-3 text-right font-mono text-[12.5px] text-[#ff6a1a]">
+                    <ExchangeBurnCell burn={event.directBurn} />
+                  </td>
+                  <td className="px-2 py-3 text-right font-mono text-[12.5px] text-[#a6b2c4]">
+                    <ExchangeBurnCell burn={event.buybackBurn} />
+                  </td>
+                  <td className="whitespace-nowrap px-2 py-3 text-[11.5px] text-[#8a8f9b]">
+                    {event.buybackStatus ? (
+                      <span title={event.buybackId ?? undefined}>
+                        {event.buybackStatus === "RECORDED_SIMULATED_EXECUTION"
+                          ? "execution recorded · simulated"
+                          : "proposed · simulated"}
+                        {event.buybackExecutedEmber
+                          ? ` · ${fmt(event.buybackExecutedEmber, 4)} EMBER`
+                          : ""}
+                      </span>
+                    ) : (
+                      "—"
+                    )}
+                  </td>
+                  <td className="whitespace-nowrap px-2 py-3">
+                    <span
+                      className={`rounded-full px-2.5 py-1 text-[11px] font-bold ${EXCHANGE_STATUS_TONE[event.status] ?? "bg-[#1a1d23] text-[#c5cfde]"}`}
+                      title={event.detail ?? event.reasonCode}
+                    >
+                      {event.status} · {event.reasonCode}
+                    </span>
+                    {event.status !== "COMPLETED" && event.status !== "INELIGIBLE" && (
+                      <span className="ml-2 font-mono text-[10.5px] text-[#6f7580]">
+                        attempt {event.attempts}/{event.maxAttempts}
+                      </span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <p className="px-2 py-2 text-[12.5px] text-[#8a8f9b]">
+        Newest first · the split column is what the adaptive policy applied to this order, which the
+        configured baseline is overridden by as treasury health changes. Buybacks are recorded
+        simulations — no EMBER was bought from a market.
+      </p>
+    </section>
   );
 }
 

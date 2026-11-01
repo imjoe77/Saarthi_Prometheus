@@ -124,15 +124,16 @@ describe('evaluateEligibility', () => {
 
 describe('sizeCopyOrder', () => {
   const CASH = DEFAULT_COPY_INITIAL_CASH; // 100000
+  const WALLET = new Prisma.Decimal('1000000');
 
   const size = (overrides: Partial<Parameters<typeof sizeCopyOrder>[0]> = {}) =>
     sizeCopyOrder({
-      side: 'BUY',
+      side: 'LONG',
       expertQuantity: new Prisma.Decimal('10'),
       allocationFraction: new Prisma.Decimal('0.25'),
       fillPrice: new Prisma.Decimal('100'),
       cash: CASH,
-      positionQuantity: new Prisma.Decimal('0'),
+      walletUsdt: WALLET,
       ...overrides,
     });
 
@@ -170,7 +171,7 @@ describe('sizeCopyOrder', () => {
     }
   });
 
-  describe('the BUY bound', () => {
+  describe('the LONG bound', () => {
     it('takes the smaller of the scaled quantity and what the copy cash can fund', () => {
       // Scaled intent is 10 at 100 each (1000) but only 500 of copy cash exists.
       const result = size({
@@ -213,35 +214,68 @@ describe('sizeCopyOrder', () => {
     });
   });
 
-  describe('the SELL bound', () => {
-    const sell = (overrides: Partial<Parameters<typeof sizeCopyOrder>[0]> = {}) =>
-      size({ side: 'SELL', ...overrides });
+  describe('the SHORT bound', () => {
+    const short = (overrides: Partial<Parameters<typeof sizeCopyOrder>[0]> = {}) =>
+      size({ side: 'SHORT', ...overrides });
 
-    it('takes the smaller of the scaled quantity and what the follower holds', () => {
-      const result = sell({ allocationFraction: new Prisma.Decimal('1'), positionQuantity: new Prisma.Decimal('4') });
-      expect(result).toMatchObject({ quantity: new Prisma.Decimal('4'), gross: new Prisma.Decimal('400') });
+    it('takes the scaled quantity exactly, because a short is not bounded by the book', () => {
+      const result = short({ allocationFraction: new Prisma.Decimal('1') });
+      expect(result).toMatchObject({ quantity: new Prisma.Decimal('10'), gross: new Prisma.Decimal('1000') });
     });
 
-    it('closes the whole position when the scaled sell is larger than the holding', () => {
-      const result = sell({
-        allocationFraction: new Prisma.Decimal('1'),
-        positionQuantity: new Prisma.Decimal('1'),
-      });
-      expect(result).toMatchObject({ quantity: new Prisma.Decimal('1'), gross: new Prisma.Decimal('100') });
-    });
-
-    it('refuses a SELL when the follower holds nothing - never a short position', () => {
-      const result = sell({ positionQuantity: new Prisma.Decimal('0') });
-      expect(result).toEqual({ executable: false, rejectReason: 'INSUFFICIENT_POSITION' });
+    it('is never bounded by the copy cash, because a short brings the notional in', () => {
+      const result = short({ allocationFraction: new Prisma.Decimal('1'), cash: new Prisma.Decimal('0') });
+      expect(result).toMatchObject({ quantity: new Prisma.Decimal('10'), gross: new Prisma.Decimal('1000') });
     });
 
     it('refuses before the bound when the scaled quantity rounds to zero', () => {
-      const result = sell({
+      const result = short({
         expertQuantity: new Prisma.Decimal('1'),
         allocationFraction: new Prisma.Decimal('0.000000001'),
-        positionQuantity: new Prisma.Decimal('0'),
       });
       expect(result).toEqual({ executable: false, rejectReason: 'ALLOCATION_ROUNDED_TO_ZERO' });
+    });
+  });
+
+  describe('INSUFFICIENT_WALLET_BALANCE', () => {
+    it('refuses a copy the follower\'s real USDT balance cannot cover', () => {
+      const result = size({
+        allocationFraction: new Prisma.Decimal('1'),
+        fillPrice: new Prisma.Decimal('100'),
+        walletUsdt: new Prisma.Decimal('999'),
+      });
+      expect(result).toEqual({ executable: false, rejectReason: 'INSUFFICIENT_WALLET_BALANCE' });
+    });
+
+    it('refuses a short too, because the notional still has to be covered', () => {
+      const result = size({
+        side: 'SHORT',
+        allocationFraction: new Prisma.Decimal('1'),
+        fillPrice: new Prisma.Decimal('100'),
+        walletUsdt: new Prisma.Decimal('999'),
+      });
+      expect(result).toEqual({ executable: false, rejectReason: 'INSUFFICIENT_WALLET_BALANCE' });
+    });
+
+    it('accepts a notional the balance covers exactly', () => {
+      const result = size({
+        allocationFraction: new Prisma.Decimal('1'),
+        fillPrice: new Prisma.Decimal('100'),
+        walletUsdt: new Prisma.Decimal('1000'),
+      });
+      expect(result).toMatchObject({ quantity: new Prisma.Decimal('10'), gross: new Prisma.Decimal('1000') });
+    });
+
+    it('checks the balance against the copy that would actually happen, not the intention', () => {
+      // The cash bound trims the copy to 5 units (500), which the balance of 500
+      // covers exactly - even though the unscaled intent was 1000.
+      const result = size({
+        allocationFraction: new Prisma.Decimal('1'),
+        fillPrice: new Prisma.Decimal('100'),
+        cash: new Prisma.Decimal('500'),
+        walletUsdt: new Prisma.Decimal('500'),
+      });
+      expect(result).toMatchObject({ quantity: new Prisma.Decimal('5'), gross: new Prisma.Decimal('500') });
     });
   });
 });

@@ -61,12 +61,22 @@ describe('AiDoubtSolverService', () => {
       expect(fetchSpy).not.toHaveBeenCalled();
     });
 
-    it('matches a whole-word keyword so "il" never resolves to a token called off', async () => {
+    it('matches a whole-word keyword so "il" never resolves to a token called off', () => {
       const entry = matchKnowledgeEntry({ query: 'what does il mean here' });
 
       // "il" is not a keyword of any entry; the fallback says so rather than
       // matching some substring inside "portfolio" or "token'.
       expect(entry.id).toBe(FALLBACK_ENTRY.id);
+    });
+
+    it('answers the direction question a copy-trading reader actually asks', async () => {
+      const service = await build();
+
+      const answer = await service.ask(ask({ query: 'what is a short position' }));
+
+      expect(answer.concept).toBe('Long and short positions');
+      expect(answer.sections.simple.toLowerCase()).toContain('sell first');
+      expect(answer.sections.remember.toLowerCase()).toContain('other direction');
     });
 
     it('uses the inspected element when the question itself is generic', async () => {
@@ -131,13 +141,20 @@ describe('AiDoubtSolverService', () => {
       },
     };
 
+    /** A fetch mock carrying only the fields the service reads from a response. */
+    function modelResponse(body: unknown, ok = true, status = 200): Response {
+      return { ok, status, json: () => Promise.resolve(body) } as unknown as Response;
+    }
+
+    /** The JSON body the service actually POSTed, parsed for assertions. */
+    function sentJson(init: RequestInit | undefined): Record<string, unknown> {
+      const raw = typeof init?.body === 'string' ? init.body : '';
+      return JSON.parse(raw) as Record<string, unknown>;
+    }
+
     it('forwards the widget payload and returns the model answer', async () => {
       const service = await build('http://model.local/answer');
-      fetchSpy.mockResolvedValue({
-        ok: true,
-        status: 200,
-        json: async () => modelAnswer,
-      } as Response);
+      fetchSpy.mockResolvedValue(modelResponse(modelAnswer));
 
       const answer = await service.ask(ask({ history: [{ role: 'user', content: 'hi' }] }));
 
@@ -145,7 +162,7 @@ describe('AiDoubtSolverService', () => {
       expect(fetchSpy).toHaveBeenCalledTimes(1);
       const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
       expect(url).toBe('http://model.local/answer');
-      expect(JSON.parse(String(init.body))).toMatchObject({
+      expect(sentJson(init)).toMatchObject({
         query: 'What is impermanent loss?',
         history: [{ role: 'user', content: 'hi' }],
       });
@@ -154,7 +171,7 @@ describe('AiDoubtSolverService', () => {
 
     it('trims history to the widget maximum of 8 turns', async () => {
       const service = await build('http://model.local/answer');
-      fetchSpy.mockResolvedValue({ ok: true, json: async () => modelAnswer } as Response);
+      fetchSpy.mockResolvedValue(modelResponse(modelAnswer));
 
       const history = Array.from({ length: 12 }, (_, index) => ({
         role: 'user',
@@ -163,17 +180,33 @@ describe('AiDoubtSolverService', () => {
       await service.ask(ask({ history }));
 
       const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
-      expect((JSON.parse(String(init.body)).history as unknown[]).length).toBe(8);
+      expect(sentJson(init)['history']).toHaveLength(8);
     });
 
     it('falls back to the knowledge base when the model errors', async () => {
       const service = await build('http://model.local/answer');
-      fetchSpy.mockResolvedValue({ ok: false, status: 503 } as Response);
+      fetchSpy.mockResolvedValue(modelResponse(null, false, 503));
 
       const answer = await service.ask(ask());
 
       expect(answer.concept).toBe('Impermanent loss');
       expect(warnSpy).toHaveBeenCalled();
+    });
+
+    it('never lets the model hold the request past what the frontend waits for', async () => {
+      // The BFF waits 25s and the widget gives up at 30s, so the
+      // knowledge-base fallback has to be delivered before either of them.
+      const timeoutSpy = jest.spyOn(AbortSignal, 'timeout');
+      try {
+        const service = await build('http://model.local/answer');
+        fetchSpy.mockResolvedValue(modelResponse(null, false, 503));
+
+        await service.ask(ask());
+
+        expect(timeoutSpy).toHaveBeenCalledWith(12_000);
+      } finally {
+        timeoutSpy.mockRestore();
+      }
     });
 
     it('falls back when the model is unreachable (network/timeout)', async () => {
@@ -187,15 +220,19 @@ describe('AiDoubtSolverService', () => {
 
     it('falls back when the model answers in the wrong shape', async () => {
       const service = await build('http://model.local/answer');
-      fetchSpy.mockResolvedValue({
-        ok: true,
-        json: async () => ({ concept: 'Model', sections: {} }),
-      } as Response);
+      fetchSpy.mockResolvedValue(modelResponse({ concept: 'Model', sections: {} }));
 
       const answer = await service.ask(ask());
 
       expect(answer.concept).toBe('Impermanent loss');
     });
+  });
+});
+
+describe('model timeout configuration', () => {
+  it('defaults to 20 seconds and honours an explicit override', () => {
+    expect(new AppConfig({ nodeEnv: 'test' }).aiModelTimeoutMs).toBe(20_000);
+    expect(new AppConfig({ nodeEnv: 'test', aiModelTimeoutMs: 24_000 }).aiModelTimeoutMs).toBe(24_000);
   });
 });
 

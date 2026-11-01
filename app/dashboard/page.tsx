@@ -328,7 +328,7 @@ const ELIGIBILITY_SHORT: Record<CopyEligibility, string> = {
   STRATEGY_NOT_ELIGIBLE: "Strategy not live",
   ALLOCATION_ROUNDED_TO_ZERO: "Rounds to zero",
   INSUFFICIENT_COPY_CASH: "Copy cash low",
-  INSUFFICIENT_POSITION: "Nothing held to sell",
+  INSUFFICIENT_WALLET_BALANCE: "USDT balance low",
   PRICE_UNAVAILABLE: "Waiting on a price",
 };
 

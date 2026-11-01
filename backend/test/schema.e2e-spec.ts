@@ -200,8 +200,10 @@ describe('Module 01 schema', () => {
       // and updated_at on sentinel_voice_calls (24 total - the call row's own
       // lifecycle times are queued_at/initiated_at/completed_at, deliberately
       // not the generic pair). Module 03b added two: both columns on
-      // wallet_deposits (26 total).
-      expect(rows).toHaveLength(26);
+      // wallet_deposits (26 total). The Module 08 x 11 outbox added one:
+      // updated_at on exchange_revenue_events, whose creation stamp is
+      // detected_at - when the order settled, not when a session touched the row.
+      expect(rows).toHaveLength(27);
       for (const row of rows) {
         // A naive timestamp would re-interpret its value in whatever session
         // time zone happens to be set, which silently corrupts audit history.
